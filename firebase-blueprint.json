@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "app_data": {
+      "title": "AppData",
+      "description": "Shared real-time application state across all users",
+      "type": "object",
+      "properties": {
+        "customers": {
+          "type": "array",
+          "description": "List of customer order records"
+        },
+        "bulkItems": {
+          "type": "array",
+          "description": "List of bulk OCR processed items"
+        },
+        "msgTemplateCod": {
+          "type": "string",
+          "description": "COD WhatsApp template"
+        },
+        "msgTemplateNoCod": {
+          "type": "string",
+          "description": "No-COD WhatsApp template"
+        },
+        "msgTemplateTitip": {
+          "type": "string",
+          "description": "Titip COD WhatsApp template"
+        },
+        "msgTemplateOh": {
+          "type": "string",
+          "description": "On-Hold (OH) Sending camera WhatsApp template"
+        },
+        "msgTemplateReturn": {
+          "type": "string",
+          "description": "Return Sending camera WhatsApp template"
+        },
+        "tempatCodList": {
+          "type": "array",
+          "description": "List of drop off location settings"
+        },
+        "waReportNumber": {
+          "type": "string",
+          "description": "Target WhatsApp Business number for Sending camera photo, name, and address"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last modification"
+        }
+      },
+      "required": ["customers", "updatedAt"]
+    }
+  }
+}

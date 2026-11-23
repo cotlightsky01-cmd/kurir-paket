@@ -1,0 +1,11 @@
+{
+  "name": "Kurir Paket sess",
+  "description": "A luxury-themed utility application for Shopee and delivery couriers to parse raw address lists, organize customer modules, filter rapidly, and initiate automated WhatsApp messages.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

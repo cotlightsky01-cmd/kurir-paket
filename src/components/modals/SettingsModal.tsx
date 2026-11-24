@@ -13,6 +13,8 @@ interface SettingsModalProps {
   setMsgTemplateNoCod: (val: string) => void;
   msgTemplateTitip: string;
   setMsgTemplateTitip: (val: string) => void;
+  msgTemplateAutoCodOnly?: string;
+  setMsgTemplateAutoCodOnly?: (val: string) => void;
   msgTemplateOh?: string;
   setMsgTemplateOh?: (val: string) => void;
   msgTemplateReturn?: string;
@@ -51,6 +53,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   setMsgTemplateNoCod,
   msgTemplateTitip,
   setMsgTemplateTitip,
+  msgTemplateAutoCodOnly = '',
+  setMsgTemplateAutoCodOnly,
   msgTemplateOh = '',
   setMsgTemplateOh,
   msgTemplateReturn = '',
@@ -262,6 +266,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               />
             </div>
 
+            {/* Template Otomatis COD Saja (Sudah Pernah Chat, Tanpa Shareloc) */}
+            {setMsgTemplateAutoCodOnly && (
+              <div>
+                <label className="block font-bold text-emerald-400 text-[10px] tracking-wider uppercase mb-1.5">
+                  Template Otomatis COD (Sudah Pernah Chat — Tanpa Shareloc):
+                </label>
+                <textarea 
+                  value={msgTemplateAutoCodOnly}
+                  onChange={(e) => setMsgTemplateAutoCodOnly(e.target.value)}
+                  rows={2}
+                  className="w-full p-2.5 rounded-xl bg-neutral-900 border border-neutral-800 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none transition-all resize-none text-white text-[11px] leading-relaxed"
+                  placeholder="Template info nominal COD saja tanpa meminta shareloc..."
+                />
+              </div>
+            )}
+
             {/* Template OH & Return (Kamera Sending) */}
             {setMsgTemplateOh && setMsgTemplateReturn && (
               <div className="p-3 bg-[#141416] border border-emerald-500/20 rounded-xl space-y-3">
@@ -388,8 +408,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             {/* Placeholder Guide Info */}
-            <div className="p-2.5 rounded-xl bg-neutral-900/50 border border-neutral-800/80 text-neutral-500 text-[10px] leading-relaxed">
-              Gunakan placeholder <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{Nama}`}</code>, <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{COD}`}</code> (dibulatkan), dan <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{tempat cod}`}</code> untuk menyisipkan data secara otomatis.
+            <div className="p-2.5 rounded-xl bg-neutral-900/50 border border-neutral-800/80 text-neutral-400 text-[10px] leading-relaxed space-y-1">
+              <p>
+                Gunakan placeholder <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{Nama}`}</code>, <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{COD}`}</code> (dibulatkan), dan <code className="bg-neutral-800 text-neutral-300 px-1 py-0.5 rounded font-mono font-bold">{`{tempat cod}`}</code> untuk menyisipkan data secara otomatis.
+              </p>
+              <p className="text-neutral-500">
+                Setiap template di atas menjadi <strong className="text-neutral-300">acuan struktur penyampaian</strong>: isi pesan tiap customer otomatis divariasikan secara halus agar tidak kaku/kembar tanpa menyimpang dari template yang ditetapkan.
+              </p>
             </div>
 
             <div className="h-px bg-neutral-800 my-2" />

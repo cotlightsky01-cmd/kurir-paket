@@ -15,7 +15,7 @@ import {
   Plus
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { Customer, TempatCodLocation } from '../types';
+import { Customer, TempatCodLocation, WaAutoSendItemResult } from '../types';
 import { 
   getPackageCount, 
   getMatchingTempatCod, 
@@ -48,6 +48,7 @@ interface CustomerCardProps {
   moveToModul3AndCapture: (customer: Customer) => void;
   returnToModul1: (id: string) => void;
   toggleCustomerCompletedDate?: (id: string) => void;
+  autoSendItem?: WaAutoSendItemResult;
 }
 
 export const CustomerCard: React.FC<CustomerCardProps> = ({
@@ -73,6 +74,7 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
   moveToModul3AndCapture,
   returnToModul1,
   toggleCustomerCompletedDate,
+  autoSendItem,
 }) => {
   const isModul2Today = cust.status === 'modul2' && isToday(cust.completedAt || cust.timestamp);
   const cardSeqNumber = displayIndex !== undefined ? displayIndex : cust.originalIndex;
@@ -129,6 +131,46 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
             )}
             {cust.status === 'modul1' && (
               <div className="flex items-center gap-1">
+                {autoSendItem && (
+                  <span
+                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
+                      autoSendItem.status === 'sent_full'
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                        : autoSendItem.status === 'sent_cod_only'
+                        ? 'bg-[#C5A059]/20 text-[#E9D5A6] border-[#C5A059]/40'
+                        : autoSendItem.status === 'skipped_chatted'
+                        ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                        : autoSendItem.status === 'waiting_delay' || autoSendItem.status === 'sending'
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
+                        : autoSendItem.status === 'paused'
+                        ? 'bg-amber-500/15 text-amber-200 border-amber-500/30'
+                        : autoSendItem.status === 'invalid_phone' ||
+                          autoSendItem.status === 'unregistered' ||
+                          autoSendItem.status === 'failed'
+                        ? 'bg-red-500/15 text-red-300 border-red-500/30'
+                        : 'bg-neutral-800 text-neutral-400 border-neutral-700'
+                    }`}
+                    title={autoSendItem.reason || ''}
+                  >
+                    {autoSendItem.status === 'sent_full'
+                      ? 'Auto: Lengkap'
+                      : autoSendItem.status === 'sent_cod_only'
+                      ? 'Auto: COD Saja'
+                      : autoSendItem.status === 'skipped_chatted'
+                      ? 'Skip (Sudah Chat)'
+                      : autoSendItem.status === 'waiting_delay'
+                      ? 'Menunggu Jeda...'
+                      : autoSendItem.status === 'sending'
+                      ? 'Mengirim...'
+                      : autoSendItem.status === 'paused'
+                      ? 'Dijeda'
+                      : autoSendItem.status === 'pending'
+                      ? 'Antrean'
+                      : autoSendItem.status === 'cancelled'
+                      ? 'Dihentikan'
+                      : 'Gagal / Invalid'}
+                  </span>
+                )}
                 <span className="text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/10">
                   Incoming
                 </span>

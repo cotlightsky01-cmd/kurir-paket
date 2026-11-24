@@ -25,7 +25,8 @@ import {
   compressImageDataUrl, 
   cleanAddressText,
   cleanPureName,
-  deduplicateById
+  deduplicateById,
+  insertCustomerPreservingOrder
 } from '../utils/helpers';
 
 interface BulkProcessorViewProps {
@@ -60,6 +61,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
   const isPausedRef = useRef(false);
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(new Set());
   const [isSending, setIsSending] = useState(false);
+  const [sendNotice, setSendNotice] = useState<string | null>(null);
   const [isClearingAll, setIsClearingAll] = useState(false);
   const [copied, setCopied] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -75,6 +77,9 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOffsetY, setDragOffsetY] = useState(0);
 
+  const bulkItemsRef = useRef<BulkItem[]>(bulkItems);
+  bulkItemsRef.current = bulkItems;
+  const sendNoticeTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listContainerRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -168,16 +173,23 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     if (addBulkItems) {
       addBulkItems(urls);
     } else if (setBulkItems) {
-      const startOrder = bulkItems.length + 1;
       const now = Date.now();
       const randStr = Math.random().toString(36).substring(2, 7);
-      const newItems: BulkItem[] = urls.map((url, idx) => ({
-        id: `fill_${now}_${randStr}_${idx}`,
-        order: startOrder + idx,
-        image_url: url,
-        status: 'pending'
-      }));
-      setBulkItems(prev => [...prev, ...newItems]);
+      setBulkItems(prev => {
+        const cleanPrev = deduplicateById(prev);
+        const existingBatchId = cleanPrev.find(item => item.fillingBatchId)?.fillingBatchId;
+        const activeBatchId = existingBatchId || `fbatch_${now}_${randStr}`;
+        const maxOrder = cleanPrev.reduce((max, item) => Math.max(max, Number(item.order) || 0), 0);
+        const startOrder = maxOrder + 1;
+        const newItems: BulkItem[] = urls.map((url, idx) => ({
+          id: `fill_${now}_${randStr}_${idx}`,
+          order: startOrder + idx,
+          image_url: url,
+          status: 'pending',
+          fillingBatchId: activeBatchId,
+        }));
+        return [...cleanPrev, ...newItems];
+      });
     }
   };
 
@@ -232,12 +244,16 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
       if (fromIndex === -1 || toIndex < 0 || toIndex >= ordered.length || fromIndex === toIndex) {
         return prev;
       }
+      // Preserve existing order slot numbers so partially-sent batches keep non-colliding Filling orders
+      const sortedOrderSlots = ordered
+        .map((item, index) => (typeof item.order === 'number' && Number.isFinite(item.order) ? item.order : index + 1))
+        .sort((a, b) => a - b);
       const next = [...ordered];
       const [moved] = next.splice(fromIndex, 1);
       next.splice(toIndex, 0, moved);
       return next.map((item, index) => ({
         ...item,
-        order: index + 1
+        order: sortedOrderSlots[index] ?? (index + 1)
       }));
     });
   }, [setBulkItems]);
@@ -498,27 +514,46 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     }
 
     await new Promise(r => setTimeout(r, 200));
+    setSendNotice(null);
     if (onClearFilling) onClearFilling();
     if (clearBulkItems) clearBulkItems();
     setIsClearingAll(false);
   };
 
-  // SEND FUNCTIONALITY with rapid 1-by-1 sliding animation
+  // SEND FUNCTIONALITY: Only sends items with status === 'completed',
+  // leaves unfinished items in Filling so generation continues uninterrupted,
+  // and preserves original Filling batch order when sent in multiple stages.
   const handleSendAllToSending = async () => {
-    if (bulkItems.length === 0 || isSending) return;
+    const currentSnapshot = deduplicateById(bulkItemsRef.current);
+    const itemsToSend = currentSnapshot
+      .filter(item => item.status === 'completed')
+      .sort((a, b) => a.order - b.order);
 
-    // Immediately stop generate processes as data is moved to sending module
-    isPausedRef.current = true;
-    setIsPaused(true);
-    setProcessing(false);
+    if (itemsToSend.length === 0 || isSending) return;
 
     setIsSending(true);
+    if (sendNoticeTimerRef.current !== null) {
+      window.clearTimeout(sendNoticeTimerRef.current);
+      sendNoticeTimerRef.current = null;
+    }
 
-    const itemsToSend = [...bulkItems].sort((a, b) => a.order - b.order);
+    // Ensure all items in this Filling session share one consistent fillingBatchId
+    // so later partial sends slot right back into their original positions in Sending.
+    const existingBatchId = currentSnapshot.find(b => b.fillingBatchId)?.fillingBatchId;
+    const activeBatchId = existingBatchId || `fbatch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    if (setBulkItems) {
+      setBulkItems(prev =>
+        prev.map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
+      );
+    }
+
+    const sentIds = new Set<string>();
 
     for (let i = 0; i < itemsToSend.length; i++) {
       const item = itemsToSend[i];
-      
+      sentIds.add(item.id);
+
       const rawName = cleanPureName(item.name?.trim() || '') || 'Tanpa Nama';
       const cleanAddr = cleanAddressText(item.address?.trim() || '') || 'Data Filling';
       const rawPhone = item.phone?.trim() || '';
@@ -528,7 +563,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
 
       const newCustomer: Customer = {
         id: `cust_${item.id}_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 6)}`,
-        originalIndex: (customers?.length || 0) + 1,
+        originalIndex: item.order || (customers?.length || 0) + 1,
         name: rawName,
         phone: rawPhone,
         cleanPhone: cleanPh.length >= 8 ? cleanPh : '',
@@ -538,18 +573,25 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
         package_count: pkgCount,
         status: 'modul1',
         photos: [],
-        timestamp: Date.now() + i
+        timestamp: Date.now() + i,
+        fillingBatchId: item.fillingBatchId || activeBatchId,
+        fillingOrder: item.order,
       };
 
       if (setCustomers) {
-        setCustomers(prev => deduplicateById([...prev, newCustomer]));
+        setCustomers(prev => insertCustomerPreservingOrder(prev, newCustomer));
       } else if (syncAddresses) {
         syncAddresses([item]);
       }
 
-      // Remove from bulkItems so Framer Motion triggers exit animation
+      // Remove only this completed item from bulkItems so Framer Motion triggers exit animation
+      // while unfinished items stay in Filling and continue generating.
       if (setBulkItems) {
-        setBulkItems(prev => prev.filter(b => b.id !== item.id));
+        setBulkItems(prev =>
+          prev
+            .filter(b => b.id !== item.id)
+            .map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
+        );
       }
 
       // Fast stagger delay between items
@@ -558,10 +600,22 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
 
     // Small delay after last item slides out
     await new Promise(res => setTimeout(res, 120));
+    const remainingItems = bulkItemsRef.current.filter(b => !sentIds.has(b.id));
     setIsSending(false);
 
-    if (onNavigateToSending) {
-      onNavigateToSending();
+    if (remainingItems.length === 0) {
+      setSendNotice(null);
+      if (onNavigateToSending) {
+        onNavigateToSending();
+      }
+    } else {
+      setSendNotice(
+        `${itemsToSend.length} data selesai dikirim ke Sending. ${remainingItems.length} data masih diproses di Filling.`
+      );
+      sendNoticeTimerRef.current = window.setTimeout(() => {
+        setSendNotice(null);
+        sendNoticeTimerRef.current = null;
+      }, 4500);
     }
   };
 
@@ -871,6 +925,9 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     }
   };
 
+  const completedCount = bulkItems.filter(i => i.status === 'completed').length;
+  const pendingCount = bulkItems.length - completedCount;
+
   return (
     <div 
       onDragOver={handleDragOver}
@@ -882,7 +939,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
       )}
     >
       {/* Header */}
-      <div className="flex justify-between items-center mb-4 bg-[#18181B] border border-[#232328] rounded-2xl p-3.5 shadow-sm">
+      <div className="flex justify-between items-center mb-3 bg-[#18181B] border border-[#232328] rounded-2xl p-3.5 shadow-sm">
         <div>
           <h1 className="text-sm font-extrabold tracking-wider text-[#C5A059] uppercase">FILLING / BULK PROCESSOR</h1>
           <p className="text-[11px] text-neutral-400 font-medium">
@@ -896,7 +953,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
         <div className="flex gap-2">
           {bulkItems.length > 0 && (
             <>
-              {bulkItems.some(i => i.status === 'completed') && (
+              {completedCount > 0 && (
                 <button 
                   onClick={handleCopyAll}
                   className={cn(
@@ -911,12 +968,16 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
               )}
               <button 
                 onClick={handleSendAllToSending}
-                disabled={isSending || bulkItems.length === 0}
+                disabled={isSending || completedCount === 0}
                 className="px-3 py-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 rounded-xl active:scale-95 transition-all flex items-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-                title="Kirim seluruh data ke modul Sending"
+                title="Kirim data yang sudah selesai generate ke modul Sending"
               >
                 <Send size={14} className={isSending ? "animate-pulse" : ""} />
-                {isSending ? "SENDING..." : "SEND"}
+                {isSending
+                  ? "SENDING..."
+                  : pendingCount > 0 && completedCount > 0
+                    ? `SEND (${completedCount})`
+                    : "SEND"}
               </button>
             </>
           )}
@@ -930,6 +991,20 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
           </button>
         </div>
       </div>
+
+      {sendNotice && (
+        <div className="mb-3 px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px] font-semibold flex items-center justify-between gap-2">
+          <span>{sendNotice}</span>
+          <button
+            type="button"
+            onClick={() => setSendNotice(null)}
+            className="p-0.5 rounded hover:bg-white/10 text-emerald-300/80 hover:text-white cursor-pointer shrink-0"
+            title="Tutup notifikasi"
+          >
+            <CloseIcon size={13} />
+          </button>
+        </div>
+      )}
 
       {/* Grid / List of items */}
       <div

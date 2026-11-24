@@ -15,10 +15,16 @@ import {
   Calendar,
   MessageCircle,
   RotateCcw,
-  PhoneOff
+  PhoneOff,
+  Play,
+  Pause,
+  Wifi,
+  WifiOff,
+  QrCode,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Customer, TempatCodLocation, BulkItem } from './types';
+import { Customer, TempatCodLocation, BulkItem, WaGatewayState, WaAutoSendState, HoldGroupResolvedItem } from './types';
 import { BulkProcessorView } from './components/BulkProcessorView';
 import { CustomerCard } from './components/CustomerCard';
 import { SuccessView } from './components/views/SuccessView';
@@ -26,13 +32,14 @@ import { InputDock } from './components/InputDock';
 import { FloatingPhotoBar } from './components/FloatingPhotoBar';
 
 import { WASheetModal } from './components/modals/WASheetModal';
-import { LiveCameraModal } from './components/modals/LiveCameraModal';
+import { LiveCameraModal, SendingCameraSendResult, HoldCameraSendResult } from './components/modals/LiveCameraModal';
 import { PhotoLightboxModal } from './components/modals/PhotoLightboxModal';
 import { DropOffLocationModal } from './components/modals/DropOffLocationModal';
 import { DayChangeHoldModal } from './components/modals/DayChangeHoldModal';
 import { ArchiveModal } from './components/modals/ArchiveModal';
 import { ResetSuccessModal } from './components/modals/ResetSuccessModal';
 import { SettingsModal } from './components/modals/SettingsModal';
+import { WAAutoConnectModal } from './components/modals/WAAutoConnectModal';
 
 import {
   cleanPhoneNumber,
@@ -53,17 +60,17 @@ import {
   prepareFirestorePayload,
   stripCompletedBulkImages,
   compressImageDataUrl,
-  dataUrlToFile,
-  formatPhoneForWaSearch,
-  copyTextToClipboardSyncOrAsync,
   deduplicateById,
   buildHoldCameraTemplateText,
   buildHoldOhReturnTemplateText,
   DEFAULT_LOCATIONS,
   DEFAULT_COD_TEMPLATE,
   DEFAULT_NOCOD_TEMPLATE,
-  DEFAULT_TITIP_TEMPLATE
+  DEFAULT_TITIP_TEMPLATE,
+  DEFAULT_AUTO_COD_ONLY_TEMPLATE
 } from './utils/helpers';
+import { buildVariedTemplateMessage } from './utils/templateVariation';
+import { HOLD_ON_HOLD_GROUP_OPTIONS } from './utils/holdGroups';
 
 export default function App() {
   // State variables with local storage persistence
@@ -99,6 +106,9 @@ export default function App() {
   const [msgTemplateTitip, setMsgTemplateTitip] = useState<string>(() => {
     return localStorage.getItem('kurir_parser_msg_template_titip') || DEFAULT_TITIP_TEMPLATE;
   });
+  const [msgTemplateAutoCodOnly, setMsgTemplateAutoCodOnly] = useState<string>(() => {
+    return localStorage.getItem('kurir_parser_msg_template_auto_cod_only') || DEFAULT_AUTO_COD_ONLY_TEMPLATE;
+  });
   const [waReportNumber, setWaReportNumber] = useState<string>(() => {
     return localStorage.getItem('kurir_parser_wa_report_number') || '';
   });
@@ -129,6 +139,58 @@ export default function App() {
   const [showResetModal, setShowResetModal] = useState(false);
   const [dropOffModalCustomer, setDropOffModalCustomer] = useState<Customer | null>(null);
   const [lightboxPhoto, setLightboxPhoto] = useState<string | null>(null);
+  const [showWaConnectModal, setShowWaConnectModal] = useState(false);
+
+  // WhatsApp Baileys Gateway & Sending Auto-Send states
+  const [waGateway, setWaGateway] = useState<WaGatewayState>({
+    status: 'disconnected',
+    qrDataUrl: null,
+    pairingCode: null,
+    user: null,
+    knownChatsCount: 0,
+    hasSession: false,
+    lastError: null,
+  });
+  const [waAutoSend, setWaAutoSend] = useState<WaAutoSendState>({
+    running: false,
+    phase: 'idle',
+    total: 0,
+    processed: 0,
+    sentFullCount: 0,
+    sentCodOnlyCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    currentCustomerId: null,
+    currentCustomerName: null,
+    nextSendAt: null,
+    delaySeconds: null,
+    startedAt: null,
+    finishedAt: null,
+    lastError: null,
+    items: {},
+  });
+  const [showAutoSendBanner, setShowAutoSendBanner] = useState(false);
+  const [autoSendCountdownSec, setAutoSendCountdownSec] = useState(0);
+  const [holdGroups, setHoldGroups] = useState<HoldGroupResolvedItem[]>(() =>
+    HOLD_ON_HOLD_GROUP_OPTIONS.map((g) => ({
+      ...g,
+      subject: null,
+      jid: null,
+      resolved: false,
+    }))
+  );
+  const [selectedHoldGroupUrl, setSelectedHoldGroupUrl] = useState<string>(() => {
+    const saved = localStorage.getItem('kurir_parser_hold_group_url');
+    if (saved && HOLD_ON_HOLD_GROUP_OPTIONS.some((g) => g.url === saved)) {
+      return saved;
+    }
+    return HOLD_ON_HOLD_GROUP_OPTIONS[0].url;
+  });
+
+  const handleSelectHoldGroupUrl = (url: string) => {
+    setSelectedHoldGroupUrl(url);
+    safeSetLocalStorage('kurir_parser_hold_group_url', url);
+  };
 
   // WhatsApp invalid / not registered alert modal state
   const [waErrorModal, setWaErrorModal] = useState<{ show: boolean; customerName: string; phone: string } | null>(null);
@@ -246,13 +308,14 @@ export default function App() {
     safeSetLocalStorage('kurir_parser_msg_template_cod', msgTemplateCod);
     safeSetLocalStorage('kurir_parser_msg_template_nocod', msgTemplateNoCod);
     safeSetLocalStorage('kurir_parser_msg_template_titip', msgTemplateTitip);
+    safeSetLocalStorage('kurir_parser_msg_template_auto_cod_only', msgTemplateAutoCodOnly);
     safeSetLocalStorage('kurir_parser_tempat_cod_list', JSON.stringify(tempatCodList));
     safeSetLocalStorage('kurir_parser_wa_report_number', waReportNumber);
 
     if (!isDailySyncInFlightRef.current) {
       setSaveStatus('saved');
     }
-  }, [customers, bulkItems, msgTemplateCod, msgTemplateNoCod, msgTemplateTitip, tempatCodList, waReportNumber]);
+  }, [customers, bulkItems, msgTemplateCod, msgTemplateNoCod, msgTemplateTitip, msgTemplateAutoCodOnly, tempatCodList, waReportNumber]);
 
   // Persist archive changes locally as well
   useEffect(() => {
@@ -498,6 +561,7 @@ export default function App() {
 
     const activeCust = customers.find(c => c.id === cameraActiveForId);
     if (activeCust?.status === 'modul1') {
+      void refreshWaGatewayStatus();
       setIsFetchingSendingGps(true);
       fetchCurrentLocationUrl()
         .then(url => {
@@ -506,6 +570,9 @@ export default function App() {
         .finally(() => {
           setIsFetchingSendingGps(false);
         });
+    } else if (activeCust?.status === 'modul3') {
+      void refreshWaGatewayStatus();
+      void refreshHoldGroups();
     }
 
     let isSubscribed = true;
@@ -743,10 +810,16 @@ export default function App() {
 
     if (activeDropOffName) {
       // Automatically use Tempat Titip COD template when a matching location exists or is selected
-      textToSend = msgTemplateTitip
-        .replace(/\{Nama\}/gi, customer.name)
-        .replace(/\{COD\}/gi, roundedCod)
-        .replace(/\{tempat cod\}/gi, activeDropOffName);
+      textToSend = buildVariedTemplateMessage({
+        category: 'titip',
+        template: msgTemplateTitip,
+        customerName: customer.name,
+        codFormatted: roundedCod,
+        isNoCod,
+        titipLocationName: activeDropOffName,
+        customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+        sequenceIndex: customer.originalIndex,
+      });
 
       setCustomers(prev => prev.map(c => c.id === customer.id ? {
         ...c,
@@ -757,13 +830,25 @@ export default function App() {
     } else {
       if (!customer.waTemplateSent) {
         if (isNoCod) {
-          textToSend = msgTemplateNoCod
-            .replace(/\{Nama\}/gi, customer.name)
-            .replace(/\{COD\}/gi, roundedCod);
+          textToSend = buildVariedTemplateMessage({
+            category: 'nocod',
+            template: msgTemplateNoCod,
+            customerName: customer.name,
+            codFormatted: roundedCod,
+            isNoCod: true,
+            customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+            sequenceIndex: customer.originalIndex,
+          });
         } else {
-          textToSend = msgTemplateCod
-            .replace(/\{Nama\}/gi, customer.name)
-            .replace(/\{COD\}/gi, roundedCod);
+          textToSend = buildVariedTemplateMessage({
+            category: 'cod',
+            template: msgTemplateCod,
+            customerName: customer.name,
+            codFormatted: roundedCod,
+            isNoCod: false,
+            customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+            sequenceIndex: customer.originalIndex,
+          });
         }
         setCustomers(prev => prev.map(c => c.id === customer.id ? {
           ...c,
@@ -1010,214 +1095,144 @@ export default function App() {
     setSelectedPhotos([]);
   };
 
-  // Open customer's registered WhatsApp chat directly with Hold template text
-  const openHoldCustomerWaChat = (customer: Customer, messageText: string) => {
-    const rawPhone = customer.phone || '';
-    const phone = customer.cleanPhone || cleanPhoneNumber(rawPhone);
-
-    if (!rawPhone || !isValidWhatsAppNumber(rawPhone) || !isValidWhatsAppNumber(phone)) {
-      triggerWaNotRegisteredAlert(customer.name, rawPhone || customer.phone || '');
-      return;
-    }
-
-    const encodedText = encodeURIComponent(messageText);
-    const useBusiness = waTargetApp === 'business';
-    const webUrl = `https://api.whatsapp.com/send?phone=${phone}&text=${encodedText}`;
-
-    if (useBusiness) {
-      const businessUrl = `whatsapp-business://send?phone=${phone}&text=${encodedText}`;
-      try {
-        window.location.href = businessUrl;
-        setTimeout(() => {
-          if (!document.hidden) {
-            window.open(webUrl, '_blank');
-          }
-        }, 700);
-      } catch {
-        window.open(webUrl, '_blank');
-      }
-    } else {
-      window.open(webUrl, '_blank');
-    }
-  };
-
-  // Send captured Hold photo + template message to buyer via Web Share API (actual photo + text),
-  // automatically copying the buyer's phone number to clipboard for WhatsApp search
-  const handleSendHoldCameraToCustomer = async (
+  // Send Hold photo automatically via Baileys in 2 messages:
+  // (1) Photo + customer template caption to buyer's registered WhatsApp number
+  // (2) Photo + "oh" or "return" caption to the selected On Hold WhatsApp group
+  const handleSendHoldCameraBundle = async (
     customer: Customer,
     photoUrl: string,
-    messageText: string
-  ): Promise<{ ok: boolean; method: 'web_share' | 'download_fallback' | 'cancelled' | 'error'; messageText?: string; copiedPhone?: string | null }> => {
-    const rawPhone = customer.phone || '';
-    const phone = customer.cleanPhone || cleanPhoneNumber(rawPhone);
-
-    if (!rawPhone || !isValidWhatsAppNumber(rawPhone) || !isValidWhatsAppNumber(phone)) {
-      triggerWaNotRegisteredAlert(customer.name, rawPhone || customer.phone || '');
-      return { ok: false, method: 'error' };
-    }
-
-    const searchPhone = formatPhoneForWaSearch(rawPhone, phone);
-    const clipboardCopyPromise = searchPhone
-      ? copyTextToClipboardSyncOrAsync(searchPhone)
-      : Promise.resolve(false);
-
-    let photoFile: File | null = photoUrl ? dataUrlToFile(photoUrl, customer.name) : null;
-    if (!photoFile && photoUrl) {
-      try {
-        const res = await fetch(photoUrl);
-        const blob = await res.blob();
-        const mimeType = blob.type || 'image/jpeg';
-        const ext = mimeType.includes('png') ? 'png' : 'jpg';
-        const safeName = (customer.name || 'paket').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 32);
-        photoFile = new File([blob], `paket_${safeName}.${ext}`, { type: mimeType });
-      } catch (err) {
-        console.warn('Failed to prepare Hold photo file:', err);
-      }
-    }
-
-    if (photoFile && typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
-      const canShareFiles = typeof navigator.canShare === 'function'
-        ? navigator.canShare({ files: [photoFile] })
-        : true;
-
-      if (canShareFiles) {
-        try {
-          await navigator.share({
-            files: [photoFile],
-            title: `Bukti Paket ${customer.name}`,
-            text: messageText,
-          });
-          const copiedOk = await clipboardCopyPromise;
-          return { ok: true, method: 'web_share', messageText, copiedPhone: copiedOk ? searchPhone : null };
-        } catch (err: any) {
-          if (err?.name === 'AbortError') {
-            const copiedOk = await clipboardCopyPromise;
-            return { ok: false, method: 'cancelled', messageText, copiedPhone: copiedOk ? searchPhone : null };
-          }
-          console.warn('Hold Web Share failed/blocked, using download + buyer WA fallback:', err);
-        }
-      }
-    }
-
-    if (photoFile) {
-      try {
-        const downloadUrl = URL.createObjectURL(photoFile);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = photoFile.name;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 4000);
-      } catch (dlErr) {
-        console.warn('Hold photo download fallback failed:', dlErr);
-      }
-    }
-
-    const copiedOk = await clipboardCopyPromise;
-    openHoldCustomerWaChat(customer, messageText);
-    return { ok: true, method: 'download_fallback', messageText, copiedPhone: copiedOk ? searchPhone : null };
-  };
-
-  // Share Hold photo + OH / Return template directly via Web Share API
-  const handleShareHoldOhReturn = async (
-    customer: Customer,
-    photoUrl: string,
+    templateCaption: string,
     ohReturnType: 'oh' | 'return',
-    customText?: string
-  ): Promise<{ ok: boolean; method: 'web_share' | 'download_fallback' | 'cancelled' | 'error'; messageText?: string; copiedPhone?: string | null }> => {
-    if (!photoUrl) return { ok: false, method: 'error' };
+    groupUrl: string
+  ): Promise<HoldCameraSendResult> => {
+    if (!photoUrl) {
+      return { ok: false, method: 'error', error: 'Foto tidak ditemukan.' };
+    }
 
-    const messageText = customText?.trim() || buildHoldOhReturnTemplateText(customer, ohReturnType);
-    const searchPhone = waReportNumber.trim()
-      ? formatPhoneForWaSearch(waReportNumber.trim())
-      : formatPhoneForWaSearch(customer.phone, customer.cleanPhone);
+    const rawPhone = customer.phone || '';
+    const phone = customer.cleanPhone || cleanPhoneNumber(rawPhone);
+    if (!rawPhone || !isValidWhatsAppNumber(rawPhone) || !isValidWhatsAppNumber(phone)) {
+      return {
+        ok: false,
+        method: 'invalid_phone',
+        error: `Nomor terdaftar pelanggan (${rawPhone || 'kosong'}) tidak valid untuk WhatsApp.`,
+      };
+    }
 
-    const clipboardCopyPromise = searchPhone
-      ? copyTextToClipboardSyncOrAsync(searchPhone)
-      : Promise.resolve(false);
+    if (!groupUrl || !HOLD_ON_HOLD_GROUP_OPTIONS.some((g) => g.url === groupUrl)) {
+      return {
+        ok: false,
+        method: 'missing_group',
+        error: 'Silakan pilih salah satu grup On Hold tujuan terlebih dahulu.',
+      };
+    }
 
-    let photoFile: File | null = dataUrlToFile(photoUrl, `${ohReturnType}_${customer.name}`);
-    if (!photoFile) {
+    if (waGateway.status !== 'connected') {
+      return {
+        ok: false,
+        method: 'not_connected',
+        error: 'WhatsApp belum terhubung. Hubungkan WA terlebih dahulu untuk mengirim 2 pesan otomatis.',
+      };
+    }
+
+    const finalTemplate = (templateCaption || '').trim();
+    if (!finalTemplate) {
+      return {
+        ok: false,
+        method: 'error',
+        error: 'Keterangan template pesan pelanggan masih kosong.',
+      };
+    }
+
+    const ohReturnCaption = buildHoldOhReturnTemplateText(customer, ohReturnType);
+
+    let finalDataUrl = photoUrl;
+    if (!finalDataUrl.startsWith('data:image')) {
       try {
         const res = await fetch(photoUrl);
         const blob = await res.blob();
-        const mimeType = blob.type || 'image/jpeg';
-        const ext = mimeType.includes('png') ? 'png' : 'jpg';
-        const safeName = (customer.name || 'paket').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 32);
-        photoFile = new File([blob], `${ohReturnType}_${safeName}.${ext}`, { type: mimeType });
-      } catch (err) {
-        console.warn('Failed to prepare OH/Return photo file:', err);
-        return { ok: false, method: 'error' };
+        finalDataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('Gagal membaca foto'));
+          reader.readAsDataURL(blob);
+        });
+      } catch {
+        return { ok: false, method: 'error', error: 'Gagal memproses file foto.' };
       }
     }
-
-    if (photoFile && typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
-      const canShareFiles = typeof navigator.canShare === 'function'
-        ? navigator.canShare({ files: [photoFile] })
-        : true;
-
-      if (canShareFiles) {
-        try {
-          await navigator.share({
-            files: [photoFile],
-            title: `${ohReturnType === 'oh' ? 'OH' : 'Return'} - ${customer.name}`,
-            text: messageText,
-          });
-          const copiedOk = await clipboardCopyPromise;
-          return { ok: true, method: 'web_share', messageText, copiedPhone: copiedOk ? searchPhone : null };
-        } catch (err: any) {
-          if (err?.name === 'AbortError') {
-            const copiedOk = await clipboardCopyPromise;
-            return { ok: false, method: 'cancelled', messageText, copiedPhone: copiedOk ? searchPhone : null };
-          }
-          console.warn('OH/Return Web Share failed/blocked, using download + WA fallback:', err);
-        }
-      }
-    }
-
-    if (photoFile) {
-      try {
-        const downloadUrl = URL.createObjectURL(photoFile);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = photoFile.name;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 4000);
-      } catch (dlErr) {
-        console.warn('OH/Return photo download fallback failed:', dlErr);
-      }
-    }
-
-    const copiedOk = await clipboardCopyPromise;
-    openWaBusinessTextLink(messageText);
-    return { ok: true, method: 'download_fallback', messageText, copiedPhone: copiedOk ? searchPhone : null };
-  };
-
-  // Send captured photo + name + address + GPS location via Web Share API (no photo clipboard; copies target phone for WA search)
-  const openWaBusinessTextLink = (messageText: string) => {
-    const encodedText = encodeURIComponent(messageText);
-    const cleanedTarget = waReportNumber.trim() ? cleanPhoneNumber(waReportNumber.trim()) : '';
-
-    const businessUrl = cleanedTarget && cleanedTarget.length >= 9
-      ? `whatsapp-business://send?phone=${cleanedTarget}&text=${encodedText}`
-      : `whatsapp-business://send?text=${encodedText}`;
-
-    const webUrl = cleanedTarget && cleanedTarget.length >= 9
-      ? `https://api.whatsapp.com/send?phone=${cleanedTarget}&text=${encodedText}`
-      : `https://api.whatsapp.com/send?text=${encodedText}`;
 
     try {
-      window.location.href = businessUrl;
-      setTimeout(() => {
-        if (!document.hidden) {
-          window.open(webUrl, '_blank');
+      const res = await fetch('/api/wa/send-hold-bundle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetPhone: phone,
+          imageDataUrl: finalDataUrl,
+          templateCaption: finalTemplate,
+          groupInviteUrl: groupUrl,
+          ohReturnCaption,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data?.gateway) {
+        setWaGateway(data.gateway);
+      }
+
+      if (data?.buyerSent) {
+        setCustomers((prev) =>
+          prev.map((c) =>
+            c.id === customer.id ? { ...c, waTemplateSent: true } : c
+          )
+        );
+      }
+
+      if (!res.ok || !data?.ok) {
+        if (data?.notConnected || res.status === 409) {
+          return {
+            ok: false,
+            method: 'not_connected',
+            buyerSent: false,
+            groupSent: false,
+            error: data?.error || 'WhatsApp belum terhubung.',
+          };
         }
-      }, 700);
-    } catch {
-      window.open(webUrl, '_blank');
+        if (data?.partialError || data?.buyerSent) {
+          return {
+            ok: false,
+            method: 'partial_error',
+            buyerSent: Boolean(data?.buyerSent),
+            groupSent: Boolean(data?.groupSent),
+            sentToPhone: data?.targetPhone || phone,
+            groupLabel: data?.groupSubject,
+            error: data?.error || 'Pesan ke pelanggan terkirim, namun gagal mengirim ke grup On Hold.',
+          };
+        }
+        return {
+          ok: false,
+          method: 'error',
+          buyerSent: false,
+          groupSent: false,
+          error: data?.error || 'Gagal mengirim 2 pesan otomatis.',
+        };
+      }
+
+      void refreshHoldGroups();
+
+      return {
+        ok: true,
+        method: 'baileys_dual',
+        buyerSent: true,
+        groupSent: true,
+        sentToPhone: data.targetPhone || phone,
+        groupLabel: data.groupSubject,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        method: 'error',
+        error: err?.message || 'Gagal terhubung ke server pengirim WhatsApp.',
+      };
     }
   };
 
@@ -1225,15 +1240,27 @@ export default function App() {
     customer: Customer,
     photoUrl: string,
     gpsUrl?: string | null
-  ): Promise<{ ok: boolean; method: 'web_share' | 'download_fallback' | 'cancelled' | 'error'; messageText?: string; copiedPhone?: string | null }> => {
-    if (!photoUrl) return { ok: false, method: 'error' };
+  ): Promise<SendingCameraSendResult> => {
+    if (!photoUrl) {
+      return { ok: false, method: 'error', error: 'Foto tidak ditemukan.' };
+    }
 
-    const targetReportSearchPhone = waReportNumber.trim()
-      ? formatPhoneForWaSearch(waReportNumber.trim())
-      : '';
-    const clipboardCopyPromise = targetReportSearchPhone
-      ? copyTextToClipboardSyncOrAsync(targetReportSearchPhone)
-      : Promise.resolve(false);
+    const cleanedTarget = waReportNumber.trim() ? cleanPhoneNumber(waReportNumber.trim()) : '';
+    if (!cleanedTarget || cleanedTarget.length < 9) {
+      return {
+        ok: false,
+        method: 'missing_target',
+        error: 'Nomor tujuan WhatsApp belum diatur atau tidak valid.',
+      };
+    }
+
+    if (waGateway.status !== 'connected') {
+      return {
+        ok: false,
+        method: 'not_connected',
+        error: 'WhatsApp belum terhubung. Hubungkan WA terlebih dahulu.',
+      };
+    }
 
     let finalGpsUrl = gpsUrl || sendingSessionLocationUrl;
     if (!finalGpsUrl) {
@@ -1255,66 +1282,68 @@ export default function App() {
     ];
     const messageText = messageLines.join('\n');
 
-    let photoFile: File | null = dataUrlToFile(photoUrl, customer.name);
-    if (!photoFile) {
+    let finalDataUrl = photoUrl;
+    if (!finalDataUrl.startsWith('data:image')) {
       try {
         const res = await fetch(photoUrl);
         const blob = await res.blob();
-        const mimeType = blob.type || 'image/jpeg';
-        const ext = mimeType.includes('png') ? 'png' : 'jpg';
-        const safeName = (customer.name || 'paket').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 32);
-        photoFile = new File([blob], `paket_${safeName}.${ext}`, { type: mimeType });
-      } catch (err) {
-        console.warn('Failed to prepare image file for sharing:', err);
-        return { ok: false, method: 'error' };
+        finalDataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('Gagal membaca foto'));
+          reader.readAsDataURL(blob);
+        });
+      } catch {
+        return { ok: false, method: 'error', messageText, error: 'Gagal memproses file foto.' };
       }
     }
 
-    // Primary path: Web Share API (shares actual image file + caption text; phone number copied to clipboard for WA search)
-    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function' && photoFile) {
-      const canShareFiles = typeof navigator.canShare === 'function'
-        ? navigator.canShare({ files: [photoFile] })
-        : true;
+    try {
+      const res = await fetch('/api/wa/send-media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetPhone: cleanedTarget,
+          imageDataUrl: finalDataUrl,
+          caption: messageText,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data?.gateway) {
+        setWaGateway(data.gateway);
+      }
 
-      if (canShareFiles) {
-        try {
-          await navigator.share({
-            files: [photoFile],
-            title: `Paket ${customer.name}`,
-            text: messageText,
-          });
-          const copiedOk = await clipboardCopyPromise;
-          return { ok: true, method: 'web_share', messageText, copiedPhone: copiedOk ? targetReportSearchPhone : null };
-        } catch (err: any) {
-          if (err?.name === 'AbortError') {
-            const copiedOk = await clipboardCopyPromise;
-            return { ok: false, method: 'cancelled', messageText, copiedPhone: copiedOk ? targetReportSearchPhone : null };
-          }
-          console.warn('Web Share API failed or blocked, falling back to file download + WA link:', err);
+      if (!res.ok || !data?.ok) {
+        if (data?.notConnected || res.status === 409) {
+          return {
+            ok: false,
+            method: 'not_connected',
+            messageText,
+            error: data?.error || 'WhatsApp belum terhubung.',
+          };
         }
+        return {
+          ok: false,
+          method: 'error',
+          messageText,
+          error: data?.error || 'Gagal mengirim pesan otomatis ke nomor tujuan.',
+        };
       }
-    }
 
-    // Fallback when Web Share API with files is unsupported (e.g., desktop / restricted iframe):
-    // Download image file (no photo clipboard) and open WhatsApp Business with text data
-    if (photoFile) {
-      try {
-        const downloadUrl = URL.createObjectURL(photoFile);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = photoFile.name;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 4000);
-      } catch (dlErr) {
-        console.warn('Image download fallback failed:', dlErr);
-      }
+      return {
+        ok: true,
+        method: 'baileys_direct',
+        messageText,
+        sentToPhone: data.targetPhone || cleanedTarget,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        method: 'error',
+        messageText,
+        error: err?.message || 'Gagal terhubung ke server pengirim WhatsApp.',
+      };
     }
-
-    const copiedOk = await clipboardCopyPromise;
-    openWaBusinessTextLink(messageText);
-    return { ok: true, method: 'download_fallback', messageText, copiedPhone: copiedOk ? targetReportSearchPhone : null };
   };
 
   // Reset modal action handlers
@@ -1489,6 +1518,277 @@ export default function App() {
   }, 0);
 
   const cameraCustomer = customers.find(c => c.id === cameraActiveForId);
+
+  // --- Baileys WhatsApp Auto-Send Helpers (Sending Module Only) ---
+  const syncWaAutoSendUpdatesToCustomers = (nextAutoSend: WaAutoSendState) => {
+    const sentItems = Object.values(nextAutoSend.items || {}).filter(
+      (it) => it.status === 'sent_full' || it.status === 'sent_cod_only'
+    );
+    if (sentItems.length === 0) return;
+
+    const sentMap = new Map(sentItems.map((it) => [it.customerId, it]));
+    setCustomers((prev) => {
+      let changed = false;
+      const next = prev.map((c) => {
+        const res = sentMap.get(c.id);
+        if (res && !c.waTemplateSent) {
+          changed = true;
+          const mappedType: 'titip' | 'cod' | 'nocod' =
+            res.templateType === 'titip'
+              ? 'titip'
+              : res.templateType === 'nocod'
+              ? 'nocod'
+              : 'cod';
+          return {
+            ...c,
+            waTemplateSent: true,
+            waLastTemplateType: mappedType,
+          };
+        }
+        return c;
+      });
+      return changed ? next : prev;
+    });
+  };
+
+  const refreshHoldGroups = async () => {
+    try {
+      const res = await fetch('/api/wa/hold-groups');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.groups) && data.groups.length > 0) {
+        setHoldGroups(data.groups);
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  const refreshWaGatewayStatus = async () => {
+    try {
+      const res = await fetch('/api/wa/status');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.gateway) setWaGateway(data.gateway);
+      if (data.autoSend) {
+        setWaAutoSend(data.autoSend);
+        syncWaAutoSendUpdatesToCustomers(data.autoSend);
+        if (data.autoSend.running) {
+          setShowAutoSendBanner(true);
+        }
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  const connectWaGatewayClient = async () => {
+    const res = await fetch('/api/wa/connect', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Gagal menghubungkan WhatsApp');
+    if (data.gateway) setWaGateway(data.gateway);
+    if (data.autoSend) setWaAutoSend(data.autoSend);
+  };
+
+  const requestWaPairingCodeClient = async (phone: string): Promise<string | null> => {
+    const res = await fetch('/api/wa/pairing-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Gagal meminta kode pairing');
+    if (data.gateway) setWaGateway(data.gateway);
+    return data.code || null;
+  };
+
+  const logoutWaGatewayClient = async () => {
+    const res = await fetch('/api/wa/logout', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Gagal memutuskan WhatsApp');
+    if (data.gateway) setWaGateway(data.gateway);
+    if (data.autoSend) setWaAutoSend(data.autoSend);
+  };
+
+  const handleStartAutoSendSending = async () => {
+    if (activeTab !== 'modul1') return;
+
+    if (waGateway.status !== 'connected') {
+      setShowWaConnectModal(true);
+      if (waGateway.status === 'disconnected') {
+        void connectWaGatewayClient().catch(() => {});
+      }
+      return;
+    }
+
+    if (filteredCustomers.length === 0) {
+      alert('Tidak ada data paket di modul Sending.');
+      return;
+    }
+
+    try {
+      const payloadItems = filteredCustomers.map((c) => ({
+        id: c.id,
+        name: c.name,
+        phone: c.phone,
+        cleanPhone: c.cleanPhone,
+        address: c.address,
+        cod: c.cod,
+        waTemplateSent: Boolean(c.waTemplateSent),
+        titipLocationName: c.titipLocationName,
+      }));
+
+      const res = await fetch('/api/wa/auto-send/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: payloadItems,
+          templates: {
+            cod: msgTemplateCod,
+            nocod: msgTemplateNoCod,
+            titip: msgTemplateTitip,
+            codOnlyNoShareloc: msgTemplateAutoCodOnly,
+          },
+          tempatCodList,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data?.error || 'Gagal memulai kirim otomatis.');
+        return;
+      }
+      if (data.gateway) setWaGateway(data.gateway);
+      if (data.autoSend) {
+        setWaAutoSend(data.autoSend);
+        setShowAutoSendBanner(true);
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Gagal menghubungi server WhatsApp.');
+    }
+  };
+
+  const handlePauseAutoSendSending = async () => {
+    try {
+      const res = await fetch('/api/wa/auto-send/pause', { method: 'POST' });
+      const data = await res.json();
+      if (data.gateway) setWaGateway(data.gateway);
+      if (data.autoSend) {
+        setWaAutoSend(data.autoSend);
+        syncWaAutoSendUpdatesToCustomers(data.autoSend);
+        setShowAutoSendBanner(true);
+      }
+    } catch {
+      // Ignore pause error
+    }
+  };
+
+  const handleResumeAutoSendSending = async () => {
+    if (activeTab !== 'modul1') return;
+
+    if (waGateway.status !== 'connected') {
+      setShowWaConnectModal(true);
+      if (waGateway.status === 'disconnected') {
+        void connectWaGatewayClient().catch(() => {});
+      }
+      return;
+    }
+
+    try {
+      const payloadItems = filteredCustomers.map((c) => ({
+        id: c.id,
+        name: c.name,
+        phone: c.phone,
+        cleanPhone: c.cleanPhone,
+        address: c.address,
+        cod: c.cod,
+        waTemplateSent: Boolean(c.waTemplateSent),
+        titipLocationName: c.titipLocationName,
+      }));
+
+      const res = await fetch('/api/wa/auto-send/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: payloadItems,
+          templates: {
+            cod: msgTemplateCod,
+            nocod: msgTemplateNoCod,
+            titip: msgTemplateTitip,
+            codOnlyNoShareloc: msgTemplateAutoCodOnly,
+          },
+          tempatCodList,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data?.error || 'Gagal melanjutkan kirim otomatis.');
+        return;
+      }
+      if (data.gateway) setWaGateway(data.gateway);
+      if (data.autoSend) {
+        setWaAutoSend(data.autoSend);
+        syncWaAutoSendUpdatesToCustomers(data.autoSend);
+        setShowAutoSendBanner(true);
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Gagal menghubungi server WhatsApp.');
+    }
+  };
+
+  const handleResetAutoSendSending = async () => {
+    try {
+      const res = await fetch('/api/wa/auto-send/reset', { method: 'POST' });
+      const data = await res.json();
+      if (data.gateway) setWaGateway(data.gateway);
+      if (data.autoSend) {
+        setWaAutoSend(data.autoSend);
+        setShowAutoSendBanner(false);
+      }
+    } catch {
+      // Ignore reset error
+    }
+  };
+
+  // Initial status fetch when entering Sending or Hold tab
+  useEffect(() => {
+    if (activeTab === 'modul1') {
+      void refreshWaGatewayStatus();
+    } else if (activeTab === 'modul3') {
+      void refreshWaGatewayStatus();
+      void refreshHoldGroups();
+    }
+  }, [activeTab]);
+
+  // Refresh Hold group names whenever WhatsApp connects
+  useEffect(() => {
+    if (waGateway.status === 'connected') {
+      void refreshHoldGroups();
+    }
+  }, [waGateway.status]);
+
+  // Poll status while QR/pairing modal is open or auto-send queue is active
+  useEffect(() => {
+    if (!showWaConnectModal && !waAutoSend.running) return;
+    const timer = window.setInterval(() => {
+      void refreshWaGatewayStatus();
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [showWaConnectModal, waAutoSend.running]);
+
+  // Live 1-second countdown display for 10-20s anti-ban gap
+  useEffect(() => {
+    if (!waAutoSend.running || !waAutoSend.nextSendAt) {
+      setAutoSendCountdownSec(0);
+      return;
+    }
+    const updateTick = () => {
+      const rem = Math.max(0, Math.ceil(((waAutoSend.nextSendAt || 0) - Date.now()) / 1000));
+      setAutoSendCountdownSec(rem);
+    };
+    updateTick();
+    const timer = window.setInterval(updateTick, 500);
+    return () => window.clearInterval(timer);
+  }, [waAutoSend.running, waAutoSend.nextSendAt]);
 
   return (
     <div className="flex flex-col h-screen h-[100dvh] overflow-hidden bg-[#09090A] text-white font-sans antialiased selection:bg-[#C5A059] selection:text-black">
@@ -1767,59 +2067,197 @@ export default function App() {
             />
           ) : (
             /* SENDING (Modul 1) & HOLD (Modul 3) LISTS */
-            filteredCustomers.length === 0 ? (
-              matchingArchived.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-16 text-center text-neutral-500 space-y-3">
-                  <div className="w-12 h-12 rounded-2xl bg-[#141416] border border-[#232328] flex items-center justify-center text-neutral-600">
-                    <CheckCircle className="w-6 h-6" />
+            <>
+              {activeTab === 'modul1' && (
+                <div className="mb-2.5 space-y-2">
+                  {/* Sending-only Open Source Baileys Auto-Send Bar */}
+                  <div className="bg-[#141417] border border-[#24242A] rounded-xl p-2 flex items-center justify-between gap-2 shadow-sm">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowWaConnectModal(true);
+                        if (waGateway.status === 'disconnected') {
+                          void connectWaGatewayClient().catch(() => {});
+                        }
+                      }}
+                      className={`px-2.5 py-1.5 rounded-lg text-[10px] font-bold border flex items-center gap-1.5 transition-all cursor-pointer min-w-0 ${
+                        waGateway.status === 'connected'
+                          ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20'
+                          : 'bg-neutral-900 text-neutral-300 border-neutral-800 hover:border-[#C5A059]/40'
+                      }`}
+                      title="Kelola koneksi WhatsApp Baileys (QR / Pairing Code)"
+                    >
+                      {waGateway.status === 'connected' ? (
+                        <Wifi className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      ) : waGateway.status === 'qr_ready' || waGateway.status === 'connecting' ? (
+                        <QrCode className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      ) : (
+                        <WifiOff className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                      )}
+                      <span className="truncate">
+                        {waGateway.status === 'connected'
+                          ? `WA Aktif (${waGateway.knownChatsCount} chat)`
+                          : waGateway.status === 'qr_ready'
+                          ? 'Scan QR / Pairing'
+                          : waGateway.status === 'connecting'
+                          ? 'Menghubungkan...'
+                          : 'Hubungkan WA'}
+                      </span>
+                    </button>
+
+                    {waAutoSend.running ? (
+                      <button
+                        type="button"
+                        onClick={handlePauseAutoSendSending}
+                        className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
+                        title="Jeda sementara pengiriman otomatis dan lanjutkan nanti dari urutan terakhir"
+                      >
+                        <Pause className="w-3 h-3 fill-current" />
+                        Pause Send
+                      </button>
+                    ) : waAutoSend.phase === 'paused' ? (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={handleResumeAutoSendSending}
+                          disabled={filteredCustomers.length === 0}
+                          className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-[#C5A059] to-[#D4AF37] hover:brightness-110 disabled:opacity-40 text-black text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+                          title={`Lanjutkan kirim otomatis dari urutan berikutnya (${waAutoSend.processed}/${waAutoSend.total})`}
+                        >
+                          <Play className="w-3 h-3 fill-current" />
+                          Lanjutkan Send
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleResetAutoSendSending}
+                          className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-400 hover:text-white border border-neutral-800 transition-all cursor-pointer"
+                          title="Reset antrean kirim otomatis agar bisa mulai dari awal"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={handleStartAutoSendSending}
+                        disabled={filteredCustomers.length === 0}
+                        className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-[#C5A059] to-[#D4AF37] hover:brightness-110 disabled:opacity-40 text-black text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
+                        title="Mulai kirim pesan WhatsApp otomatis (jeda 10-20 detik, skip jika sudah pernah chat Non-COD, COD saja tanpa shareloc jika sudah pernah chat)"
+                      >
+                        <Play className="w-3 h-3 fill-current" />
+                        Mulai Kirim Otomatis
+                      </button>
+                    )}
                   </div>
-                  <div>
-                    <p className="text-xs font-bold text-neutral-400">Tidak ada paket di daftar ini</p>
-                    <p className="text-[10px] text-neutral-600 mt-0.5">
-                      {searchQuery ? 'Tidak ada hasil pencarian.' : 'Tempel data / nama di kolom atas.'}
-                    </p>
-                  </div>
+
+                  {/* Auto-Send Live Progress & Result Summary Banner */}
+                  {showAutoSendBanner && waAutoSend.phase !== 'idle' && (
+                    <div
+                      className={`rounded-xl p-2.5 border text-[10px] space-y-1.5 ${
+                        waAutoSend.running || waAutoSend.phase === 'paused'
+                          ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+                          : waAutoSend.phase === 'completed'
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                          : 'bg-neutral-900 border-neutral-800 text-neutral-300'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="font-bold flex items-center gap-1.5 min-w-0">
+                          {waAutoSend.running && (
+                            <RefreshCw className="w-3 h-3 animate-spin text-amber-400 shrink-0" />
+                          )}
+                          <span className="truncate">
+                            {waAutoSend.phase === 'waiting_delay'
+                              ? `Jeda aman ${autoSendCountdownSec}d sebelum kirim ke ${waAutoSend.currentCustomerName}`
+                              : waAutoSend.phase === 'sending' || waAutoSend.phase === 'checking'
+                              ? `Memproses: ${waAutoSend.currentCustomerName || '...'} (${waAutoSend.processed}/${waAutoSend.total})`
+                              : waAutoSend.phase === 'paused'
+                              ? `Dijeda pada ${waAutoSend.processed}/${waAutoSend.total} — siap lanjut urutan berikutnya`
+                              : waAutoSend.phase === 'completed'
+                              ? `Kirim otomatis selesai (${waAutoSend.processed}/${waAutoSend.total})`
+                              : `Kirim otomatis dihentikan (${waAutoSend.processed}/${waAutoSend.total})`}
+                          </span>
+                        </div>
+                        {!waAutoSend.running && waAutoSend.phase !== 'paused' && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAutoSendBanner(false)}
+                            className="p-0.5 rounded hover:bg-white/10 text-neutral-400 hover:text-white cursor-pointer shrink-0"
+                            title="Tutup ringkasan"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-2 text-[9px] font-mono opacity-90">
+                        <span className="text-emerald-300">Lengkap: {waAutoSend.sentFullCount}</span>
+                        <span>•</span>
+                        <span className="text-[#E9D5A6]">COD Saja: {waAutoSend.sentCodOnlyCount}</span>
+                        <span>•</span>
+                        <span className="text-sky-300">Skip: {waAutoSend.skippedCount}</span>
+                        <span>•</span>
+                        <span className="text-red-300">Gagal: {waAutoSend.failedCount}</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ) : null
-            ) : (
-              <div className="space-y-2">
-                <AnimatePresence mode="popLayout">
-                  {(() => {
-                    let runningSeq = 1;
-                    return filteredCustomers.map((cust) => {
-                      const cardSeq = runningSeq;
-                      runningSeq += getPackageCount(cust);
-                      return (
-                        <CustomerCard
-                          key={`${activeTab}_${cust.id}`}
-                          cust={cust}
-                          displayIndex={cardSeq}
-                          activeTab={activeTab}
-                          tempatCodList={tempatCodList}
-                          editingCodId={editingCodId}
-                          editingCodText={editingCodText}
-                          setEditingCodId={setEditingCodId}
-                          setEditingCodText={setEditingCodText}
-                          handleSaveCodAmount={handleSaveCodAmount}
-                          handleWhatsAppChat={handleWhatsAppChat}
-                          setDropOffModalCustomer={setDropOffModalCustomer}
-                          updatePaymentType={updatePaymentType}
-                          setCameraActiveForId={setCameraActiveForId}
-                          selectedPhotos={selectedPhotos}
-                          togglePhotoSelection={togglePhotoSelection}
-                          deleteCustomerPhoto={deleteCustomerPhoto}
-                          setLightboxPhoto={setLightboxPhoto}
-                          deleteCustomer={deleteCustomer}
-                          moveToModul2={moveToModul2}
-                          moveToModul3AndCapture={moveToModul3AndCapture}
-                          returnToModul1={returnToModul1}
-                        />
-                      );
-                    });
-                  })()}
-                </AnimatePresence>
-              </div>
-            )
+              )}
+
+              {filteredCustomers.length === 0 ? (
+                matchingArchived.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-center text-neutral-500 space-y-3">
+                    <div className="w-12 h-12 rounded-2xl bg-[#141416] border border-[#232328] flex items-center justify-center text-neutral-600">
+                      <CheckCircle className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <p className="text-xs font-bold text-neutral-400">Tidak ada paket di daftar ini</p>
+                      <p className="text-[10px] text-neutral-600 mt-0.5">
+                        {searchQuery ? 'Tidak ada hasil pencarian.' : 'Tempel data / nama di kolom atas.'}
+                      </p>
+                    </div>
+                  </div>
+                ) : null
+              ) : (
+                <div className="space-y-2">
+                  <AnimatePresence mode="popLayout">
+                    {(() => {
+                      let runningSeq = 1;
+                      return filteredCustomers.map((cust) => {
+                        const cardSeq = runningSeq;
+                        runningSeq += getPackageCount(cust);
+                        return (
+                          <CustomerCard
+                            key={`${activeTab}_${cust.id}`}
+                            cust={cust}
+                            displayIndex={cardSeq}
+                            activeTab={activeTab}
+                            tempatCodList={tempatCodList}
+                            editingCodId={editingCodId}
+                            editingCodText={editingCodText}
+                            setEditingCodId={setEditingCodId}
+                            setEditingCodText={setEditingCodText}
+                            handleSaveCodAmount={handleSaveCodAmount}
+                            handleWhatsAppChat={handleWhatsAppChat}
+                            setDropOffModalCustomer={setDropOffModalCustomer}
+                            updatePaymentType={updatePaymentType}
+                            setCameraActiveForId={setCameraActiveForId}
+                            selectedPhotos={selectedPhotos}
+                            togglePhotoSelection={togglePhotoSelection}
+                            deleteCustomerPhoto={deleteCustomerPhoto}
+                            setLightboxPhoto={setLightboxPhoto}
+                            deleteCustomer={deleteCustomer}
+                            moveToModul2={moveToModul2}
+                            moveToModul3AndCapture={moveToModul3AndCapture}
+                            returnToModul1={returnToModul1}
+                            autoSendItem={activeTab === 'modul1' ? waAutoSend.items[cust.id] : undefined}
+                          />
+                        );
+                      });
+                    })()}
+                  </AnimatePresence>
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -1853,13 +2291,19 @@ export default function App() {
           sessionLocationUrl={cameraCustomer?.status === 'modul1' ? sendingSessionLocationUrl : undefined}
           isFetchingSessionGps={cameraCustomer?.status === 'modul1' ? isFetchingSendingGps : false}
           waReportNumber={waReportNumber}
+          waGatewayStatus={waGateway.status}
           tempatCodList={tempatCodList}
-          waTargetApp={waTargetApp}
+          holdGroupOptions={holdGroups}
+          selectedHoldGroupUrl={selectedHoldGroupUrl}
+          onSelectHoldGroupUrl={handleSelectHoldGroupUrl}
           onSendCameraToWaBusiness={handleSendCameraToWaBusiness}
-          onSendTextToWaBusiness={openWaBusinessTextLink}
-          onSendHoldCameraToCustomer={handleSendHoldCameraToCustomer}
-          onOpenHoldCustomerWaChat={openHoldCustomerWaChat}
-          onShareHoldOhReturn={handleShareHoldOhReturn}
+          onSendHoldCameraBundle={handleSendHoldCameraBundle}
+          onOpenWaConnectModal={() => {
+            setShowWaConnectModal(true);
+            if (waGateway.status === 'disconnected') {
+              void connectWaGatewayClient().catch(() => {});
+            }
+          }}
           onOpenSettingsFromCamera={() => {
             setCameraActiveForId(null);
             setShowSettingsInsidePhone(true);
@@ -1898,6 +2342,8 @@ export default function App() {
           setMsgTemplateNoCod={setMsgTemplateNoCod}
           msgTemplateTitip={msgTemplateTitip}
           setMsgTemplateTitip={setMsgTemplateTitip}
+          msgTemplateAutoCodOnly={msgTemplateAutoCodOnly}
+          setMsgTemplateAutoCodOnly={setMsgTemplateAutoCodOnly}
           tempatCodList={tempatCodList}
           handleResetDefaultLocations={handleResetDefaultLocations}
           handleDeleteLocation={handleDeleteLocation}
@@ -1919,6 +2365,17 @@ export default function App() {
           toggleWaTargetApp={toggleWaTargetApp}
           waReportNumber={waReportNumber}
           setWaReportNumber={setWaReportNumber}
+        />
+
+        {/* WHATSAPP AUTO CONNECT (BAILEYS) MODAL */}
+        <WAAutoConnectModal
+          show={showWaConnectModal}
+          onClose={() => setShowWaConnectModal(false)}
+          gateway={waGateway}
+          onConnect={connectWaGatewayClient}
+          onRequestPairingCode={requestWaPairingCodeClient}
+          onLogout={logoutWaGatewayClient}
+          onRefreshStatus={refreshWaGatewayStatus}
         />
 
         {/* ARCHIVE & SEARCH MODAL */}

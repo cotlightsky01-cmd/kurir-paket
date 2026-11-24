@@ -199,6 +199,51 @@ export function deduplicateById<T extends { id: string }>(items: T[]): T[] {
   return result;
 }
 
+/**
+ * Inserts a Customer sent from Filling into the customers list while preserving
+ * its original Filling batch position (fillingBatchId + fillingOrder) instead of
+ * forcing it to the top or end when sent in multiple partial batches.
+ */
+export function insertCustomerPreservingOrder(
+  prevCustomers: Customer[],
+  newCustomer: Customer
+): Customer[] {
+  const cleanPrev = deduplicateById(prevCustomers);
+  if (cleanPrev.some((c) => c.id === newCustomer.id)) {
+    return cleanPrev;
+  }
+
+  const batchId = newCustomer.fillingBatchId;
+  const targetOrder = newCustomer.fillingOrder;
+
+  if (batchId && typeof targetOrder === 'number' && Number.isFinite(targetOrder)) {
+    const sameBatchIndices: number[] = [];
+    for (let i = 0; i < cleanPrev.length; i++) {
+      if (cleanPrev[i].fillingBatchId === batchId) {
+        sameBatchIndices.push(i);
+      }
+    }
+
+    if (sameBatchIndices.length > 0) {
+      const insertBeforeIdx = sameBatchIndices.find((idx) => {
+        const existingOrder = cleanPrev[idx].fillingOrder;
+        return typeof existingOrder === 'number' && existingOrder > targetOrder;
+      });
+
+      const next = [...cleanPrev];
+      if (insertBeforeIdx !== undefined) {
+        next.splice(insertBeforeIdx, 0, newCustomer);
+      } else {
+        const lastBatchIdx = sameBatchIndices[sameBatchIndices.length - 1];
+        next.splice(lastBatchIdx + 1, 0, newCustomer);
+      }
+      return deduplicateById(next);
+    }
+  }
+
+  return deduplicateById([...cleanPrev, newCustomer]);
+}
+
 // Client-side canvas image compressor to convert large photo uploads/captures to lightweight JPEGs
 export function compressImageDataUrl(dataUrl: string, maxWidth = 900, maxHeight = 900, quality = 0.55): Promise<string> {
   return new Promise((resolve) => {
@@ -586,6 +631,7 @@ export const DEFAULT_LOCATIONS: TempatCodLocation[] = [
 export const DEFAULT_COD_TEMPLATE = `Permisi kak {Nama}, saya kurir. Paket COD Anda nominal {COD} sudah kami antar ke lokasi ya. Mohon disiapkan uang pas, terima kasih.`;
 export const DEFAULT_NOCOD_TEMPLATE = `Permisi kak {Nama}, saya kurir. Paket Non-COD Anda sudah kami antar ke lokasi ya. Terima kasih.`;
 export const DEFAULT_TITIP_TEMPLATE = `Permisi kak {Nama}, paket Anda kami titipkan di {tempat cod} dengan nominal {COD} ya. Mohon dapat diambil, terima kasih.`;
+export const DEFAULT_AUTO_COD_ONLY_TEMPLATE = `Permisi kak {Nama}, hari ini ada paket COD nominal {COD} ya. Mohon disiapkan uang pas, terima kasih.`;
 
 export function buildHoldCameraTemplateText(
   customerName: string,

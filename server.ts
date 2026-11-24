@@ -5,6 +5,27 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getFirestore, doc, onSnapshot, setDoc, getDoc } from "firebase/firestore";
+import {
+  connectWaGateway,
+  getAutoSendState,
+  getHoldGroupsStatus,
+  getWaGatewayStatus,
+  HoldBundlePartialError,
+  initWaGatewayOnBoot,
+  logoutWaGateway,
+  pauseAutoSendQueue,
+  requestWaPairingCode,
+  resetAutoSendQueue,
+  resumeAutoSendQueue,
+  sendDirectWaMediaMessage,
+  sendHoldCameraBundle,
+  startAutoSendQueue,
+  stopAutoSendQueue,
+  WaGatewayNotConnectedError,
+  type AutoSendInputItem,
+  type AutoSendTemplates,
+  type TempatCodItem,
+} from "./server/waGateway";
 
 // Prevent unexpected background async errors from terminating the server process
 process.on('unhandledRejection', (reason, promise) => {
@@ -661,6 +682,287 @@ async function startServer() {
     }
   });
 
+  // --- WhatsApp Open Source (Baileys) Auto-Send Endpoints (Sending Module Only) ---
+  app.get("/api/wa/status", (_req, res) => {
+    res.json({
+      gateway: getWaGatewayStatus(),
+      autoSend: getAutoSendState(),
+    });
+  });
+
+  app.post("/api/wa/connect", async (_req, res) => {
+    try {
+      const gateway = await connectWaGateway();
+      res.json({
+        gateway,
+        autoSend: getAutoSendState(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Gagal menghubungkan WhatsApp." });
+    }
+  });
+
+  app.post("/api/wa/pairing-code", async (req, res) => {
+    try {
+      const rawPhone = typeof req.body?.phone === "string" ? req.body.phone.trim() : "";
+      if (!rawPhone || rawPhone.length > 30) {
+        return res.status(400).json({ error: "Nomor WhatsApp tidak valid." });
+      }
+      const result = await requestWaPairingCode(rawPhone);
+      return res.json({
+        code: result.code,
+        gateway: getWaGatewayStatus(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || "Gagal meminta kode pairing." });
+    }
+  });
+
+  app.post("/api/wa/logout", async (_req, res) => {
+    try {
+      const gateway = await logoutWaGateway();
+      return res.json({
+        gateway,
+        autoSend: getAutoSendState(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || "Gagal memutuskan koneksi WhatsApp." });
+    }
+  });
+
+  app.get("/api/wa/auto-send/status", (_req, res) => {
+    res.json({
+      gateway: getWaGatewayStatus(),
+      autoSend: getAutoSendState(),
+    });
+  });
+
+  const parseAutoSendPayload = (body: any) => {
+    const rawItems = Array.isArray(body?.items) ? body.items : [];
+    const items: AutoSendInputItem[] = rawItems
+      .filter((it: any) => it && typeof it.id === "string")
+      .slice(0, 500)
+      .map((it: any) => ({
+        id: String(it.id).slice(0, 120),
+        name: typeof it.name === "string" ? it.name.slice(0, 200) : "Pelanggan",
+        phone: typeof it.phone === "string" ? it.phone.slice(0, 40) : "",
+        cleanPhone: typeof it.cleanPhone === "string" ? it.cleanPhone.slice(0, 40) : "",
+        address: typeof it.address === "string" ? it.address.slice(0, 500) : "",
+        cod: typeof it.cod === "string" ? it.cod.slice(0, 60) : "NO COD",
+        waTemplateSent: Boolean(it.waTemplateSent),
+        titipLocationName:
+          typeof it.titipLocationName === "string" ? it.titipLocationName.slice(0, 120) : undefined,
+      }));
+
+    const rawTemplates = body?.templates || {};
+    const templates: AutoSendTemplates = {
+      cod: typeof rawTemplates.cod === "string" ? rawTemplates.cod.slice(0, 1500) : "",
+      nocod: typeof rawTemplates.nocod === "string" ? rawTemplates.nocod.slice(0, 1500) : "",
+      titip: typeof rawTemplates.titip === "string" ? rawTemplates.titip.slice(0, 1500) : "",
+      codOnlyNoShareloc:
+        typeof rawTemplates.codOnlyNoShareloc === "string"
+          ? rawTemplates.codOnlyNoShareloc.slice(0, 1500)
+          : "",
+    };
+
+    const rawLocs = Array.isArray(body?.tempatCodList) ? body.tempatCodList : [];
+    const tempatCodList: TempatCodItem[] = rawLocs
+      .filter((loc: any) => loc && typeof loc.name === "string")
+      .slice(0, 100)
+      .map((loc: any) => ({
+        id: String(loc.id || "").slice(0, 60),
+        name: String(loc.name).slice(0, 120),
+        targetAddress: typeof loc.targetAddress === "string" ? loc.targetAddress.slice(0, 300) : "",
+      }));
+
+    return { rawItemsCount: rawItems.length, items, templates, tempatCodList };
+  };
+
+  app.post("/api/wa/auto-send/start", (req, res) => {
+    try {
+      const { rawItemsCount, items, templates, tempatCodList } = parseAutoSendPayload(req.body);
+      if (rawItemsCount === 0 || rawItemsCount > 500 || items.length === 0) {
+        return res.status(400).json({ error: "Daftar pengiriman modul Sending kosong atau melebihi batas." });
+      }
+
+      const autoSend = startAutoSendQueue(items, templates, tempatCodList);
+      return res.json({
+        gateway: getWaGatewayStatus(),
+        autoSend,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || "Gagal memulai kirim otomatis." });
+    }
+  });
+
+  app.post("/api/wa/auto-send/pause", (_req, res) => {
+    const autoSend = pauseAutoSendQueue("Dijeda oleh pengguna");
+    res.json({
+      gateway: getWaGatewayStatus(),
+      autoSend,
+    });
+  });
+
+  app.post("/api/wa/auto-send/resume", (req, res) => {
+    try {
+      const hasBodyItems = Array.isArray(req.body?.items) && req.body.items.length > 0;
+      const { items, templates, tempatCodList } = parseAutoSendPayload(req.body);
+      const autoSend = resumeAutoSendQueue(
+        hasBodyItems ? items : undefined,
+        req.body?.templates ? templates : undefined,
+        Array.isArray(req.body?.tempatCodList) ? tempatCodList : undefined
+      );
+      return res.json({
+        gateway: getWaGatewayStatus(),
+        autoSend,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || "Gagal melanjutkan kirim otomatis." });
+    }
+  });
+
+  app.post("/api/wa/auto-send/reset", (_req, res) => {
+    const autoSend = resetAutoSendQueue();
+    res.json({
+      gateway: getWaGatewayStatus(),
+      autoSend,
+    });
+  });
+
+  app.post("/api/wa/auto-send/stop", (_req, res) => {
+    const autoSend = stopAutoSendQueue("Dihentikan oleh pengguna");
+    res.json({
+      gateway: getWaGatewayStatus(),
+      autoSend,
+    });
+  });
+
+  app.post("/api/wa/send-media", async (req, res) => {
+    try {
+      const targetPhone =
+        typeof req.body?.targetPhone === "string" ? req.body.targetPhone.trim().slice(0, 40) : "";
+      const imageDataUrl =
+        typeof req.body?.imageDataUrl === "string" ? req.body.imageDataUrl.trim() : "";
+      const caption =
+        typeof req.body?.caption === "string" ? req.body.caption.slice(0, 2500) : "";
+
+      if (!targetPhone) {
+        return res.status(400).json({ error: "Nomor tujuan WhatsApp belum diisi." });
+      }
+      if (!imageDataUrl || imageDataUrl.length > 15_000_000) {
+        return res.status(400).json({ error: "Data foto tidak valid atau terlalu besar." });
+      }
+
+      const result = await sendDirectWaMediaMessage({
+        targetPhone,
+        imageDataUrl,
+        caption,
+      });
+
+      return res.json({
+        ok: true,
+        ...result,
+        gateway: getWaGatewayStatus(),
+      });
+    } catch (err: any) {
+      const statusCode = err instanceof WaGatewayNotConnectedError ? 409 : 400;
+      return res.status(statusCode).json({
+        ok: false,
+        notConnected: err instanceof WaGatewayNotConnectedError,
+        error: err?.message || "Gagal mengirim foto ke nomor tujuan WhatsApp.",
+      });
+    }
+  });
+
+  app.get("/api/wa/hold-groups", async (_req, res) => {
+    try {
+      const groups = await getHoldGroupsStatus();
+      return res.json({
+        ok: true,
+        groups,
+        gateway: getWaGatewayStatus(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || "Gagal memuat daftar grup On Hold.",
+      });
+    }
+  });
+
+  app.post("/api/wa/send-hold-bundle", async (req, res) => {
+    try {
+      const targetPhone =
+        typeof req.body?.targetPhone === "string" ? req.body.targetPhone.trim().slice(0, 40) : "";
+      const imageDataUrl =
+        typeof req.body?.imageDataUrl === "string" ? req.body.imageDataUrl.trim() : "";
+      const templateCaption =
+        typeof req.body?.templateCaption === "string" ? req.body.templateCaption.slice(0, 2500) : "";
+      const groupInviteUrl =
+        typeof req.body?.groupInviteUrl === "string" ? req.body.groupInviteUrl.trim().slice(0, 300) : "";
+      const ohReturnCaption =
+        typeof req.body?.ohReturnCaption === "string" ? req.body.ohReturnCaption.trim().slice(0, 500) : "";
+
+      if (!targetPhone) {
+        return res.status(400).json({ ok: false, error: "Nomor terdaftar pelanggan belum diisi." });
+      }
+      if (!imageDataUrl || imageDataUrl.length > 15_000_000) {
+        return res.status(400).json({ ok: false, error: "Data foto tidak valid atau terlalu besar." });
+      }
+      if (!templateCaption.trim()) {
+        return res.status(400).json({ ok: false, error: "Keterangan template pesan pelanggan masih kosong." });
+      }
+      if (!groupInviteUrl) {
+        return res.status(400).json({ ok: false, error: "Grup On Hold tujuan belum dipilih." });
+      }
+      if (!ohReturnCaption) {
+        return res.status(400).json({ ok: false, error: "Keterangan OH / Return masih kosong." });
+      }
+
+      const result = await sendHoldCameraBundle({
+        targetPhone,
+        imageDataUrl,
+        templateCaption,
+        groupInviteUrl,
+        ohReturnCaption,
+      });
+
+      return res.json({
+        ok: true,
+        ...result,
+        gateway: getWaGatewayStatus(),
+      });
+    } catch (err: any) {
+      if (err instanceof WaGatewayNotConnectedError) {
+        return res.status(409).json({
+          ok: false,
+          notConnected: true,
+          buyerSent: false,
+          groupSent: false,
+          error: err.message,
+        });
+      }
+      if (err instanceof HoldBundlePartialError) {
+        return res.status(502).json({
+          ok: false,
+          partialError: true,
+          buyerSent: err.buyerSent,
+          groupSent: err.groupSent,
+          targetPhone: err.targetPhone,
+          groupSubject: err.groupSubject,
+          error: err.message,
+          gateway: getWaGatewayStatus(),
+        });
+      }
+      return res.status(400).json({
+        ok: false,
+        buyerSent: false,
+        groupSent: false,
+        error: err?.message || "Gagal mengirim 2 pesan Hold otomatis.",
+      });
+    }
+  });
+
   // Vite middleware for development vs static serve for production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -678,6 +980,7 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    initWaGatewayOnBoot();
   });
 }
 

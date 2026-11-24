@@ -30,6 +30,7 @@ export type AutoSendItemStatus =
   | "sent_full"
   | "sent_cod_only"
   | "skipped_chatted"
+  | "skipped_manual"
   | "invalid_phone"
   | "unregistered"
   | "failed"
@@ -44,6 +45,7 @@ export interface AutoSendInputItem {
   cod: string;
   waTemplateSent?: boolean;
   titipLocationName?: string;
+  manualSkipAutoSend?: boolean;
 }
 
 export interface AutoSendTemplates {
@@ -66,6 +68,8 @@ export interface AutoSendItemResult {
   status: AutoSendItemStatus;
   reason?: string;
   templateType?: "titip" | "cod" | "nocod" | "cod_only";
+  hasPriorChat?: boolean;
+  hasSentShareloc?: boolean;
   sentAt?: number;
 }
 
@@ -106,10 +110,28 @@ let manualDisconnect = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
 
-// Prior chat tracking (phones + LID resolution)
+// Prior chat, shareloc & house photo tracking (phones + LID resolution)
 const knownChattedPhones = new Set<string>();
+const knownSharelocPhones = new Set<string>();
+const knownHousePhotoPhones = new Set<string>();
 const lidToPhoneMap = new Map<string, string>();
 const pendingChattedLids = new Set<string>();
+const pendingSharelocLids = new Set<string>();
+const pendingHousePhotoLids = new Set<string>();
+interface ChatHistoryAnchor {
+  key: {
+    remoteJid: string;
+    fromMe: boolean;
+    id: string;
+  };
+  timestampMs: number;
+}
+const oldestChatAnchorByPhone = new Map<string, ChatHistoryAnchor>();
+const pendingAnchorsByLid = new Map<string, ChatHistoryAnchor>();
+const deepHistoryCheckedAt = new Map<string, number>();
+const DEEP_HISTORY_COOLDOWN_MS = 15_000;
+const onWhatsAppLidCheckedAt = new Map<string, number>();
+const historySyncListeners = new Set<() => void>();
 let saveIndexTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Hold group invite metadata cache
@@ -224,6 +246,21 @@ function getMatchingServerTempatCod(
   return null;
 }
 
+function isValidChatAnchor(anchor: any): anchor is ChatHistoryAnchor {
+  return Boolean(
+    anchor &&
+      typeof anchor === "object" &&
+      anchor.key &&
+      typeof anchor.key.remoteJid === "string" &&
+      anchor.key.remoteJid.length > 0 &&
+      typeof anchor.key.id === "string" &&
+      anchor.key.id.length > 0 &&
+      typeof anchor.timestampMs === "number" &&
+      Number.isFinite(anchor.timestampMs) &&
+      anchor.timestampMs > 0
+  );
+}
+
 function loadChatIndexFromDisk() {
   try {
     if (!fs.existsSync(CHAT_INDEX_FILE)) return;
@@ -233,6 +270,24 @@ function loadChatIndexFromDisk() {
       for (const p of parsed.phones) {
         const norm = normalizeWaPhone(String(p));
         if (norm.length >= 10) knownChattedPhones.add(norm);
+      }
+    }
+    if (Array.isArray(parsed?.sharelocPhones)) {
+      for (const p of parsed.sharelocPhones) {
+        const norm = normalizeWaPhone(String(p));
+        if (norm.length >= 10) {
+          knownSharelocPhones.add(norm);
+          knownChattedPhones.add(norm);
+        }
+      }
+    }
+    if (Array.isArray(parsed?.housePhotoPhones)) {
+      for (const p of parsed.housePhotoPhones) {
+        const norm = normalizeWaPhone(String(p));
+        if (norm.length >= 10) {
+          knownHousePhotoPhones.add(norm);
+          knownChattedPhones.add(norm);
+        }
       }
     }
     if (parsed?.lidToPhone && typeof parsed.lidToPhone === "object") {
@@ -250,8 +305,87 @@ function loadChatIndexFromDisk() {
         }
       }
     }
+    if (Array.isArray(parsed?.pendingSharelocLids)) {
+      for (const l of parsed.pendingSharelocLids) {
+        if (typeof l === "string" && l.includes("@lid")) {
+          pendingSharelocLids.add(l);
+          pendingChattedLids.add(l);
+        }
+      }
+    }
+    if (Array.isArray(parsed?.pendingHousePhotoLids)) {
+      for (const l of parsed.pendingHousePhotoLids) {
+        if (typeof l === "string" && l.includes("@lid")) {
+          pendingHousePhotoLids.add(l);
+          pendingChattedLids.add(l);
+        }
+      }
+    }
+    if (parsed?.anchorsByPhone && typeof parsed.anchorsByPhone === "object") {
+      for (const [phone, anchor] of Object.entries(parsed.anchorsByPhone)) {
+        const norm = normalizeWaPhone(phone);
+        if (norm.length >= 10 && isValidChatAnchor(anchor)) {
+          oldestChatAnchorByPhone.set(norm, {
+            key: {
+              remoteJid: anchor.key.remoteJid,
+              fromMe: Boolean(anchor.key.fromMe),
+              id: anchor.key.id,
+            },
+            timestampMs: anchor.timestampMs,
+          });
+        }
+      }
+    }
+    if (parsed?.pendingAnchorsByLid && typeof parsed.pendingAnchorsByLid === "object") {
+      for (const [lid, anchor] of Object.entries(parsed.pendingAnchorsByLid)) {
+        if (lid.includes("@lid") && isValidChatAnchor(anchor)) {
+          pendingAnchorsByLid.set(lid, {
+            key: {
+              remoteJid: anchor.key.remoteJid,
+              fromMe: Boolean(anchor.key.fromMe),
+              id: anchor.key.id,
+            },
+            timestampMs: anchor.timestampMs,
+          });
+        }
+      }
+    }
   } catch {
     // Ignore corrupt index file on startup
+  }
+}
+
+function loadAuthLidMappingsFromDisk() {
+  try {
+    if (!fs.existsSync(AUTH_DIR)) return;
+    const files = fs.readdirSync(AUTH_DIR);
+    for (const file of files) {
+      const revMatch = file.match(/^lid-mapping-(\d+)_reverse\.json$/);
+      if (revMatch) {
+        try {
+          const pnRaw = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, file), "utf8"));
+          if (typeof pnRaw === "string" && /^\d{8,16}$/.test(pnRaw)) {
+            recordLidMapping(`${revMatch[1]}@lid`, pnRaw);
+          }
+        } catch {
+          // Ignore malformed mapping file
+        }
+        continue;
+      }
+      const fwdMatch = file.match(/^lid-mapping-(\d+)\.json$/);
+      if (fwdMatch) {
+        try {
+          const lidRaw = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, file), "utf8"));
+          if (typeof lidRaw === "string" && /^\d{8,20}$/.test(lidRaw)) {
+            recordLidMapping(`${lidRaw}@lid`, fwdMatch[1]);
+          }
+        } catch {
+          // Ignore malformed mapping file
+        }
+      }
+    }
+  } catch {
+    // Ignore disk scan failure
   }
 }
 
@@ -260,10 +394,18 @@ function scheduleSaveChatIndex() {
   saveIndexTimer = setTimeout(() => {
     saveIndexTimer = null;
     try {
+      const anchorsEntries = Array.from(oldestChatAnchorByPhone.entries()).slice(-2000);
+      const pendingAnchorEntries = Array.from(pendingAnchorsByLid.entries()).slice(-2000);
       const data = {
         phones: Array.from(knownChattedPhones),
+        sharelocPhones: Array.from(knownSharelocPhones),
+        housePhotoPhones: Array.from(knownHousePhotoPhones),
         lidToPhone: Object.fromEntries(lidToPhoneMap.entries()),
         pendingLids: Array.from(pendingChattedLids).slice(-2000),
+        pendingSharelocLids: Array.from(pendingSharelocLids).slice(-2000),
+        pendingHousePhotoLids: Array.from(pendingHousePhotoLids).slice(-2000),
+        anchorsByPhone: Object.fromEntries(anchorsEntries),
+        pendingAnchorsByLid: Object.fromEntries(pendingAnchorEntries),
         updatedAt: new Date().toISOString(),
       };
       fs.writeFileSync(CHAT_INDEX_FILE, JSON.stringify(data), "utf8");
@@ -297,6 +439,155 @@ function extractPhoneFromStandardJid(jid?: string | null): string {
   return "";
 }
 
+function resolveDirectOrMappedPhone(jidRaw?: string | null, altJidRaw?: string | null): string {
+  const jid = cleanJidBase(jidRaw);
+  const altJid = cleanJidBase(altJidRaw);
+  const direct = extractPhoneFromStandardJid(jid) || extractPhoneFromStandardJid(altJid);
+  if (direct) return direct;
+  if (jid.endsWith("@lid")) {
+    return lidToPhoneMap.get(jid) || "";
+  }
+  return "";
+}
+
+function unwrapWaMessageContent(message: any): any {
+  let curr = message;
+  for (let depth = 0; depth < 6 && curr && typeof curr === "object"; depth++) {
+    if (curr.ephemeralMessage?.message) {
+      curr = curr.ephemeralMessage.message;
+      continue;
+    }
+    if (curr.viewOnceMessage?.message) {
+      curr = curr.viewOnceMessage.message;
+      continue;
+    }
+    if (curr.viewOnceMessageV2?.message) {
+      curr = curr.viewOnceMessageV2.message;
+      continue;
+    }
+    if (curr.viewOnceMessageV2Extension?.message) {
+      curr = curr.viewOnceMessageV2Extension.message;
+      continue;
+    }
+    if (curr.documentWithCaptionMessage?.message) {
+      curr = curr.documentWithCaptionMessage.message;
+      continue;
+    }
+    if (curr.editedMessage?.message) {
+      curr = curr.editedMessage.message;
+      continue;
+    }
+    break;
+  }
+  return curr;
+}
+
+function isCustomerSharelocMessage(msg: any): boolean {
+  if (!msg) return false;
+  const inner = unwrapWaMessageContent(msg.message);
+  if (!inner || typeof inner !== "object") return false;
+
+  if (inner.locationMessage || inner.liveLocationMessage) {
+    return true;
+  }
+
+  const textBody = [
+    inner.conversation,
+    inner.extendedTextMessage?.text,
+    inner.extendedTextMessage?.canonicalUrl,
+    inner.extendedTextMessage?.matchedText,
+    inner.imageMessage?.caption,
+    inner.videoMessage?.caption,
+    inner.documentMessage?.caption,
+  ]
+    .filter((v) => typeof v === "string" && v.trim())
+    .join(" ");
+
+  if (!textBody) return false;
+
+  if (
+    /(?:maps\.app\.goo\.gl|goo\.gl\/maps|maps\.google\.com|google\.com\/maps|maps\.apple\.com|waze\.com\/ul|openstreetmap\.org)/i.test(
+      textBody
+    )
+  ) {
+    return true;
+  }
+
+  if (/\b-?\d{1,2}\.\d{5,}\s*,\s*-?\d{1,3}\.\d{5,}\b/.test(textBody)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isCustomerHousePhotoMessage(msg: any): boolean {
+  if (!msg) return false;
+  const inner = unwrapWaMessageContent(msg.message);
+  if (!inner || typeof inner !== "object") return false;
+
+  const docMime =
+    typeof inner.documentMessage?.mimetype === "string"
+      ? inner.documentMessage.mimetype.toLowerCase()
+      : "";
+  const docName =
+    typeof inner.documentMessage?.fileName === "string"
+      ? inner.documentMessage.fileName.toLowerCase()
+      : "";
+  const isImageDoc =
+    docMime.startsWith("image/") ||
+    /\.(?:jpe?g|png|webp|heic|bmp)$/i.test(docName);
+
+  const isImage = Boolean(
+    inner.imageMessage || inner.albumMessage || isImageDoc
+  );
+  if (!isImage) return false;
+
+  // Exclude automated Hold/Return failure notices sent by the courier
+  if (msg?.key?.fromMe) {
+    const caption = String(
+      inner.imageMessage?.caption || inner.documentMessage?.caption || ""
+    );
+    if (
+      caption &&
+      /(?:belum\s+dapat\s+(?:kami\s+)?antar|kendala\s+pengantaran|di-?\s*hold|gagal\s+kirim|bawa\s+kembali|\bretur\b)/i.test(
+        caption
+      )
+    ) {
+      return false;
+    }
+  }
+
+  // Photos sent by either customer OR user/courier count as existing house/delivery photo
+  return true;
+}
+
+export function classifyWaHistoryMessage(msg: any): {
+  hasShareloc: boolean;
+  hasHousePhoto: boolean;
+} {
+  return {
+    hasShareloc: isCustomerSharelocMessage(msg),
+    hasHousePhoto: isCustomerHousePhotoMessage(msg),
+  };
+}
+
+function extractMessageTimestampMs(msg: any): number {
+  const raw = msg?.messageTimestamp;
+  if (!raw) return 0;
+  let num = 0;
+  if (typeof raw === "number") {
+    num = raw;
+  } else if (typeof raw === "string") {
+    num = Number(raw) || 0;
+  } else if (typeof raw?.toNumber === "function") {
+    num = raw.toNumber();
+  } else if (typeof raw?.low === "number") {
+    num = raw.low;
+  }
+  if (!num || !Number.isFinite(num)) return 0;
+  return num < 1e12 ? num * 1000 : num;
+}
+
 function recordLidMapping(lidRaw?: string | null, pnRaw?: string | null) {
   const lid = cleanJidBase(lidRaw);
   const normPn = normalizeWaPhone(
@@ -313,6 +604,35 @@ function recordLidMapping(lidRaw?: string | null, pnRaw?: string | null) {
     pendingChattedLids.delete(lid);
     if (!knownChattedPhones.has(normPn)) {
       knownChattedPhones.add(normPn);
+    }
+    changed = true;
+  }
+  if (pendingSharelocLids.has(lid)) {
+    pendingSharelocLids.delete(lid);
+    if (!knownSharelocPhones.has(normPn)) {
+      knownSharelocPhones.add(normPn);
+    }
+    if (!knownChattedPhones.has(normPn)) {
+      knownChattedPhones.add(normPn);
+    }
+    changed = true;
+  }
+  if (pendingHousePhotoLids.has(lid)) {
+    pendingHousePhotoLids.delete(lid);
+    if (!knownHousePhotoPhones.has(normPn)) {
+      knownHousePhotoPhones.add(normPn);
+    }
+    if (!knownChattedPhones.has(normPn)) {
+      knownChattedPhones.add(normPn);
+    }
+    changed = true;
+  }
+  const pendingAnchor = pendingAnchorsByLid.get(lid);
+  if (pendingAnchor) {
+    pendingAnchorsByLid.delete(lid);
+    const existing = oldestChatAnchorByPhone.get(normPn);
+    if (!existing || pendingAnchor.timestampMs < existing.timestampMs) {
+      oldestChatAnchorByPhone.set(normPn, pendingAnchor);
     }
     changed = true;
   }
@@ -371,7 +691,95 @@ function recordChattedJid(jidRaw?: string | null, altJidRaw?: string | null) {
   if (changed) scheduleSaveChatIndex();
 }
 
+function inspectChatHistoryMessage(msg: any) {
+  if (!msg?.key) return;
+  const jid = cleanJidBase(msg.key.remoteJid);
+  const altJid = cleanJidBase(msg.key.remoteJidAlt);
+
+  if (
+    !jid ||
+    jid.endsWith("@g.us") ||
+    jid === "status@broadcast" ||
+    jid.endsWith("@newsletter") ||
+    jid.endsWith("@broadcast")
+  ) {
+    return;
+  }
+
+  recordChattedJid(jid, altJid);
+
+  const resolvedPhone = resolveDirectOrMappedPhone(jid, altJid);
+  if (connectedUser?.phone && resolvedPhone === connectedUser.phone) {
+    return;
+  }
+
+  // Track oldest message anchor per phone (or pending LID) for on-demand deep history verification
+  const tsMs = extractMessageTimestampMs(msg);
+  if (msg.key.id && tsMs > 0) {
+    const candidateAnchor: ChatHistoryAnchor = {
+      key: {
+        remoteJid: msg.key.remoteJid,
+        fromMe: Boolean(msg.key.fromMe),
+        id: msg.key.id,
+      },
+      timestampMs: tsMs,
+    };
+    if (resolvedPhone) {
+      const existing = oldestChatAnchorByPhone.get(resolvedPhone);
+      if (!existing || tsMs < existing.timestampMs) {
+        oldestChatAnchorByPhone.set(resolvedPhone, candidateAnchor);
+        scheduleSaveChatIndex();
+      }
+    } else if (jid.endsWith("@lid")) {
+      const existing = pendingAnchorsByLid.get(jid);
+      if (!existing || tsMs < existing.timestampMs) {
+        pendingAnchorsByLid.set(jid, candidateAnchor);
+        scheduleSaveChatIndex();
+      }
+    }
+  }
+
+  if (isCustomerSharelocMessage(msg)) {
+    let changed = false;
+    if (resolvedPhone) {
+      if (!knownSharelocPhones.has(resolvedPhone)) {
+        knownSharelocPhones.add(resolvedPhone);
+        changed = true;
+      }
+      if (!knownChattedPhones.has(resolvedPhone)) {
+        knownChattedPhones.add(resolvedPhone);
+        changed = true;
+      }
+    } else if (jid.endsWith("@lid") && !pendingSharelocLids.has(jid)) {
+      pendingSharelocLids.add(jid);
+      pendingChattedLids.add(jid);
+      changed = true;
+    }
+    if (changed) scheduleSaveChatIndex();
+  }
+
+  if (isCustomerHousePhotoMessage(msg)) {
+    let changed = false;
+    if (resolvedPhone) {
+      if (!knownHousePhotoPhones.has(resolvedPhone)) {
+        knownHousePhotoPhones.add(resolvedPhone);
+        changed = true;
+      }
+      if (!knownChattedPhones.has(resolvedPhone)) {
+        knownChattedPhones.add(resolvedPhone);
+        changed = true;
+      }
+    } else if (jid.endsWith("@lid") && !pendingHousePhotoLids.has(jid)) {
+      pendingHousePhotoLids.add(jid);
+      pendingChattedLids.add(jid);
+      changed = true;
+    }
+    if (changed) scheduleSaveChatIndex();
+  }
+}
+
 loadChatIndexFromDisk();
+loadAuthLidMappingsFromDisk();
 
 export function hasAuthSessionFiles(): boolean {
   try {
@@ -388,6 +796,8 @@ export function getWaGatewayStatus() {
     pairingCode: currentPairingCode,
     user: connectedUser,
     knownChatsCount: knownChattedPhones.size,
+    knownSharelocCount: knownSharelocPhones.size,
+    knownHousePhotoCount: knownHousePhotoPhones.size,
     hasSession: hasAuthSessionFiles(),
     lastError: lastConnectionError,
   };
@@ -439,6 +849,7 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
       logger: logger as any,
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: true,
+      shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
     });
@@ -483,6 +894,7 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
           name: socket.user?.name || "WhatsApp Kurir",
           phone: mePhone,
         };
+        loadAuthLidMappingsFromDisk();
       }
 
       if (connection === "close") {
@@ -530,6 +942,16 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
       }
     });
 
+    const notifyHistorySyncListeners = () => {
+      for (const listener of Array.from(historySyncListeners)) {
+        try {
+          listener();
+        } catch {
+          // Ignore listener cleanup errors
+        }
+      }
+    };
+
     socket.ev.on("messaging-history.set", ({ chats, contacts, messages, lidPnMappings }) => {
       if (Array.isArray(lidPnMappings)) {
         for (const m of lidPnMappings) {
@@ -545,16 +967,28 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
       }
       if (Array.isArray(chats)) {
         for (const chat of chats) {
+          const chatLid = (chat as any)?.lidJid || (chat?.id?.endsWith("@lid") ? chat.id : undefined);
+          const chatPn = (chat as any)?.pnJid || (chat?.id?.endsWith("@s.whatsapp.net") ? chat.id : undefined);
+          if (chatLid && chatPn) {
+            recordLidMapping(chatLid, chatPn);
+          }
           if (chat?.id) {
-            recordChattedJid(chat.id);
+            recordChattedJid(chat.id, chatPn);
+          }
+          if (Array.isArray((chat as any)?.messages)) {
+            for (const entry of (chat as any).messages) {
+              const msgObj = entry?.message || entry;
+              inspectChatHistoryMessage(msgObj);
+            }
           }
         }
       }
       if (Array.isArray(messages)) {
         for (const msg of messages) {
-          recordChattedJid(msg?.key?.remoteJid, msg?.key?.remoteJidAlt);
+          inspectChatHistoryMessage(msg);
         }
       }
+      notifyHistorySyncListeners();
     });
 
     socket.ev.on("lid-mapping.update", (mapping) => {
@@ -579,21 +1013,58 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
 
     socket.ev.on("chats.upsert", (chats) => {
       for (const chat of chats) {
-        if (chat?.id) recordChattedJid(chat.id);
+        const chatLid = (chat as any)?.lidJid || (chat?.id?.endsWith("@lid") ? chat.id : undefined);
+        const chatPn = (chat as any)?.pnJid || (chat?.id?.endsWith("@s.whatsapp.net") ? chat.id : undefined);
+        if (chatLid && chatPn) {
+          recordLidMapping(chatLid, chatPn);
+        }
+        if (chat?.id) recordChattedJid(chat.id, chatPn);
+        if (Array.isArray((chat as any)?.messages)) {
+          for (const entry of (chat as any).messages) {
+            const msgObj = entry?.message || entry;
+            inspectChatHistoryMessage(msgObj);
+          }
+        }
       }
     });
 
     socket.ev.on("chats.update", (chats) => {
       for (const chat of chats) {
-        if (chat?.id) recordChattedJid(chat.id);
+        const chatLid = (chat as any)?.lidJid || (chat?.id?.endsWith("@lid") ? chat.id : undefined);
+        const chatPn = (chat as any)?.pnJid || (chat?.id?.endsWith("@s.whatsapp.net") ? chat.id : undefined);
+        if (chatLid && chatPn) {
+          recordLidMapping(chatLid, chatPn);
+        }
+        if (chat?.id) recordChattedJid(chat.id, chatPn);
+        if (Array.isArray((chat as any)?.messages)) {
+          for (const entry of (chat as any).messages) {
+            const msgObj = entry?.message || entry;
+            inspectChatHistoryMessage(msgObj);
+          }
+        }
       }
     });
 
     socket.ev.on("messages.upsert", ({ messages }) => {
       if (!Array.isArray(messages)) return;
       for (const msg of messages) {
-        recordChattedJid(msg?.key?.remoteJid, msg?.key?.remoteJidAlt);
+        inspectChatHistoryMessage(msg);
       }
+      notifyHistorySyncListeners();
+    });
+
+    socket.ev.on("messages.update", (updates) => {
+      if (!Array.isArray(updates)) return;
+      for (const u of updates) {
+        if (u?.key && u?.update?.message) {
+          inspectChatHistoryMessage({
+            key: u.key,
+            message: u.update.message,
+            messageTimestamp: (u.update as any).messageTimestamp,
+          });
+        }
+      }
+      notifyHistorySyncListeners();
     });
   } catch (err: any) {
     connectionStatus = "disconnected";
@@ -659,6 +1130,11 @@ export async function logoutWaGateway(): Promise<ReturnType<typeof getWaGatewayS
   lastConnectionError = null;
   groupInviteCache.clear();
   confirmedJoinedGroups.clear();
+  oldestChatAnchorByPhone.clear();
+  pendingAnchorsByLid.clear();
+  deepHistoryCheckedAt.clear();
+  onWhatsAppLidCheckedAt.clear();
+  historySyncListeners.clear();
 
   try {
     if (fs.existsSync(AUTH_DIR)) {
@@ -689,6 +1165,7 @@ function isTerminalAutoSendStatus(status?: AutoSendItemStatus): boolean {
     status === "sent_full" ||
     status === "sent_cod_only" ||
     status === "skipped_chatted" ||
+    status === "skipped_manual" ||
     status === "invalid_phone" ||
     status === "unregistered" ||
     status === "failed"
@@ -788,9 +1265,207 @@ async function waitInterruptible(ms: number, token: number): Promise<boolean> {
   return token === activeJobToken && autoSendState.running;
 }
 
+async function ensureDeepCustomerHistoryChecked(
+  normPhone: string,
+  requireHousePhoto = false
+): Promise<void> {
+  if (!sock || connectionStatus !== "connected") return;
+  const hasSharelocNow = knownSharelocPhones.has(normPhone);
+  const hasHousePhotoNow = knownHousePhotoPhones.has(normPhone);
+  if (hasSharelocNow && (!requireHousePhoto || hasHousePhotoNow)) return;
+
+  const now = Date.now();
+  const lastDeepCheck = deepHistoryCheckedAt.get(normPhone) || 0;
+  if (now - lastDeepCheck < DEEP_HISTORY_COOLDOWN_MS) return;
+
+  const anchor = oldestChatAnchorByPhone.get(normPhone);
+  deepHistoryCheckedAt.set(normPhone, now);
+  if (!anchor?.key?.id || !anchor.timestampMs) return;
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const isSatisfied = () =>
+      knownSharelocPhones.has(normPhone) &&
+      (!requireHousePhoto || knownHousePhotoPhones.has(normPhone));
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      historySyncListeners.delete(onHistoryUpdate);
+      resolve();
+    };
+
+    const onHistoryUpdate = () => {
+      if (isSatisfied()) {
+        done();
+      }
+    };
+
+    historySyncListeners.add(onHistoryUpdate);
+    timer = setTimeout(done, 1600);
+
+    void (async () => {
+      try {
+        if (typeof sock?.fetchMessageHistory === "function") {
+          await sock.fetchMessageHistory(50, anchor.key, anchor.timestampMs);
+          setTimeout(() => {
+            if (!settled && isSatisfied()) {
+              done();
+            }
+          }, 300);
+        } else {
+          done();
+        }
+      } catch {
+        done();
+      }
+    })();
+  });
+}
+
+async function resolveLidForPhoneFast(normPhone: string): Promise<void> {
+  if (!sock || connectionStatus !== "connected") return;
+  const now = Date.now();
+
+  try {
+    const lidMappingStore = (sock as any)?.signalRepository?.lidMapping;
+    if (typeof lidMappingStore?.getLIDForPN === "function") {
+      const resolved = await Promise.race([
+        lidMappingStore.getLIDForPN(`${normPhone}@s.whatsapp.net`),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 700)),
+      ]);
+      const cleanLid = cleanJidBase(typeof resolved === "string" ? resolved : null);
+      if (cleanLid && cleanLid.endsWith("@lid")) {
+        recordLidMapping(cleanLid, normPhone);
+      }
+    }
+  } catch {
+    // Ignore transient lidMapping store lookup failure
+  }
+
+  const lastLidCheck = onWhatsAppLidCheckedAt.get(normPhone) || 0;
+  if (
+    (!knownSharelocPhones.has(normPhone) || !knownHousePhotoPhones.has(normPhone)) &&
+    now - lastLidCheck > 60_000
+  ) {
+    onWhatsAppLidCheckedAt.set(normPhone, now);
+    try {
+      const waCheck = await Promise.race([
+        sock.onWhatsApp(`${normPhone}@s.whatsapp.net`),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 700)),
+      ]);
+      const firstCheck = waCheck?.[0];
+      const resolvedLid = cleanJidBase((firstCheck as any)?.lid);
+      if (resolvedLid && resolvedLid.endsWith("@lid")) {
+        recordLidMapping(resolvedLid, normPhone);
+      }
+    } catch {
+      // Ignore transient lookup failures
+    }
+  }
+}
+
+export interface CustomerChatCheckResult {
+  phone: string;
+  hasPriorChat: boolean;
+  hasShareloc: boolean;
+  hasHousePhoto: boolean;
+  hasAllLocationProof: boolean;
+  deepChecked: boolean;
+  gatewayConnected: boolean;
+  checkedAt: number;
+}
+
+export async function checkCustomerChatRequirements(
+  rawPhone: string,
+  options?: { deepCheck?: boolean }
+): Promise<CustomerChatCheckResult> {
+  const normPhone = normalizeWaPhone(rawPhone);
+  const gatewayConnected = connectionStatus === "connected" && Boolean(sock);
+  if (!isValidServerWaPhone(normPhone)) {
+    return {
+      phone: normPhone,
+      hasPriorChat: false,
+      hasShareloc: false,
+      hasHousePhoto: false,
+      hasAllLocationProof: false,
+      deepChecked: false,
+      gatewayConnected,
+      checkedAt: Date.now(),
+    };
+  }
+
+  if (
+    gatewayConnected &&
+    sock &&
+    (!knownSharelocPhones.has(normPhone) || !knownHousePhotoPhones.has(normPhone))
+  ) {
+    await resolveLidForPhoneFast(normPhone);
+  }
+
+  let hasPriorChat = knownChattedPhones.has(normPhone);
+  let hasShareloc = knownSharelocPhones.has(normPhone);
+  let hasHousePhoto = knownHousePhotoPhones.has(normPhone);
+
+  if (
+    options?.deepCheck !== false &&
+    gatewayConnected &&
+    (!hasShareloc || !hasHousePhoto) &&
+    oldestChatAnchorByPhone.has(normPhone)
+  ) {
+    await ensureDeepCustomerHistoryChecked(normPhone, true);
+    hasPriorChat = knownChattedPhones.has(normPhone);
+    hasShareloc = knownSharelocPhones.has(normPhone);
+    hasHousePhoto = knownHousePhotoPhones.has(normPhone);
+  }
+
+  return {
+    phone: normPhone,
+    hasPriorChat,
+    hasShareloc,
+    hasHousePhoto,
+    hasAllLocationProof: hasShareloc && hasHousePhoto,
+    deepChecked: deepHistoryCheckedAt.has(normPhone),
+    gatewayConnected,
+    checkedAt: Date.now(),
+  };
+}
+
+export function checkBatchCustomerChatRequirements(
+  rawPhones: string[]
+): Record<string, CustomerChatCheckResult> {
+  const gatewayConnected = connectionStatus === "connected" && Boolean(sock);
+  const now = Date.now();
+  const results: Record<string, CustomerChatCheckResult> = {};
+
+  for (const raw of rawPhones) {
+    const normPhone = normalizeWaPhone(raw);
+    if (!normPhone || !isValidServerWaPhone(normPhone)) continue;
+    const hasPriorChat = knownChattedPhones.has(normPhone);
+    const hasShareloc = knownSharelocPhones.has(normPhone);
+    const hasHousePhoto = knownHousePhotoPhones.has(normPhone);
+    results[normPhone] = {
+      phone: normPhone,
+      hasPriorChat,
+      hasShareloc,
+      hasHousePhoto,
+      hasAllLocationProof: hasShareloc && hasHousePhoto,
+      deepChecked: deepHistoryCheckedAt.has(normPhone),
+      gatewayConnected,
+      checkedAt: now,
+    };
+  }
+
+  return results;
+}
+
 function buildAutoMessagesForItem(
   item: AutoSendInputItem,
   hasPriorChat: boolean,
+  hasSentShareloc: boolean,
   templates: AutoSendTemplates,
   tempatCodList: TempatCodItem[],
   itemIndex: number
@@ -804,13 +1479,13 @@ function buildAutoMessagesForItem(
   const safeName = (item.name || "Pelanggan").trim();
   const seed = `${item.id}|${item.phone}|${safeName}`;
 
-  // Rule 1: Already chatted & Non-COD -> skip automatically
-  if (hasPriorChat && codAmount === 0) {
+  // Rule 1: Already chatted AND customer already sent shareloc & Non-COD -> skip automatically
+  if (hasPriorChat && hasSentShareloc && codAmount === 0) {
     return { action: "skip", text: "" };
   }
 
-  // Rule 2: Already chatted & COD -> send ONLY COD nominal template (no shareloc request)
-  if (hasPriorChat && codAmount > 0) {
+  // Rule 2: Already chatted AND customer already sent shareloc & COD -> send ONLY COD nominal template
+  if (hasPriorChat && hasSentShareloc && codAmount > 0) {
     const baseAutoTpl =
       (templates.codOnlyNoShareloc || "").trim() ||
       "Permisi kak {Nama}, hari ini ada paket COD nominal {COD} ya. Mohon disiapkan uang pas, terima kasih.";
@@ -830,7 +1505,7 @@ function buildAutoMessagesForItem(
     };
   }
 
-  // Rule 3: Never chatted -> send complete message anchored to Settings templates
+  // Rule 3: Never chatted OR already chatted without sending shareloc -> send full template (varied)
   const matchedLoc = item.titipLocationName
     ? { name: item.titipLocationName }
     : getMatchingServerTempatCod(item.address, tempatCodList);
@@ -907,6 +1582,19 @@ function runAutoSendWorker(
         break;
       }
 
+      if (item.manualSkipAutoSend) {
+        autoSendState.items[item.id] = {
+          customerId: item.id,
+          name: item.name || "Pelanggan",
+          phone: item.phone || "",
+          status: "skipped_manual",
+          reason: "Di-skip manual oleh user — dilewati otomatis",
+        };
+        autoSendState.skippedCount++;
+        autoSendState.processed++;
+        continue;
+      }
+
       autoSendState.currentCustomerId = item.id;
       autoSendState.currentCustomerName = item.name || "Pelanggan";
       autoSendState.phase = "checking";
@@ -927,9 +1615,10 @@ function runAutoSendWorker(
         continue;
       }
 
-      // Check known prior chat status
+      // Check known prior chat & shareloc status
       let hasPriorChat =
         knownChattedPhones.has(normPhone) || Boolean(item.waTemplateSent);
+      let hasSentShareloc = knownSharelocPhones.has(normPhone);
 
       // Verify registration + check LID mapping before deciding delay/send
       let targetJid = `${normPhone}@s.whatsapp.net`;
@@ -947,6 +1636,10 @@ function runAutoSendWorker(
           if (resolvedLid && resolvedLid.endsWith("@lid")) {
             if (pendingChattedLids.has(resolvedLid)) {
               hasPriorChat = true;
+            }
+            if (pendingSharelocLids.has(resolvedLid)) {
+              hasPriorChat = true;
+              hasSentShareloc = true;
             }
             recordLidMapping(resolvedLid, normPhone);
           }
@@ -981,9 +1674,31 @@ function runAutoSendWorker(
         continue;
       }
 
+      if (hasPriorChat && !hasSentShareloc) {
+        await ensureDeepCustomerHistoryChecked(normPhone, false);
+        hasSentShareloc = knownSharelocPhones.has(normPhone);
+        if (hasSentShareloc) {
+          hasPriorChat = true;
+        }
+      }
+
+      if (token !== activeJobToken || !autoSendState.running) {
+        if (isQueuePaused()) {
+          autoSendState.items[item.id] = {
+            customerId: item.id,
+            name: item.name || "Pelanggan",
+            phone: item.phone || "",
+            status: "paused",
+            reason: "Dijeda — siap dilanjutkan",
+          };
+        }
+        break;
+      }
+
       const plan = buildAutoMessagesForItem(
         item,
         hasPriorChat,
+        hasSentShareloc,
         templates,
         tempatCodList,
         itemIndex
@@ -995,7 +1710,9 @@ function runAutoSendWorker(
           name: item.name || "Pelanggan",
           phone: item.phone || "",
           status: "skipped_chatted",
-          reason: "Sudah pernah chat (Non-COD) — dilewati otomatis",
+          hasPriorChat,
+          hasSentShareloc,
+          reason: "Sudah pernah chat & sudah kirim shareloc (Non-COD) — dilewati otomatis",
         };
         autoSendState.skippedCount++;
         autoSendState.processed++;
@@ -1020,6 +1737,8 @@ function runAutoSendWorker(
             name: item.name || "Pelanggan",
             phone: item.phone || "",
             status: "waiting_delay",
+            hasPriorChat,
+            hasSentShareloc,
             reason: `Menunggu jeda aman ${autoSendState.delaySeconds} detik`,
           };
 
@@ -1052,6 +1771,8 @@ function runAutoSendWorker(
         name: item.name || "Pelanggan",
         phone: item.phone || "",
         status: "sending",
+        hasPriorChat,
+        hasSentShareloc,
         reason: "Mengirim pesan...",
       };
 
@@ -1074,11 +1795,15 @@ function runAutoSendWorker(
           phone: item.phone || "",
           status: resultStatus,
           templateType: plan.templateType,
+          hasPriorChat,
+          hasSentShareloc,
           sentAt: Date.now(),
           reason:
             plan.action === "send_cod_only"
-              ? "Terkirim template COD saja (tanpa shareloc)"
-              : "Terkirim pesan lengkap",
+              ? "Sudah chat & shareloc — terkirim template COD saja"
+              : hasPriorChat && !hasSentShareloc
+              ? "Sudah pernah chat tapi belum shareloc — terkirim pesan lengkap"
+              : "Belum pernah chat — terkirim pesan lengkap",
         };
 
         if (plan.action === "send_cod_only") {
@@ -1092,6 +1817,8 @@ function runAutoSendWorker(
           name: item.name || "Pelanggan",
           phone: item.phone || "",
           status: "failed",
+          hasPriorChat,
+          hasSentShareloc,
           reason: err?.message || "Gagal mengirim pesan WhatsApp",
         };
         autoSendState.failedCount++;
@@ -1222,7 +1949,11 @@ export function resumeAutoSendQueue(
   const remainingQueue: AutoSendInputItem[] = [];
   for (const item of sourceItems) {
     const existing = nextMap[item.id];
-    if (existing && isTerminalAutoSendStatus(existing.status)) {
+    if (
+      existing &&
+      isTerminalAutoSendStatus(existing.status) &&
+      !(existing.status === "skipped_manual" && !item.manualSkipAutoSend)
+    ) {
       continue;
     }
     nextMap[item.id] = {
@@ -1246,7 +1977,7 @@ export function resumeAutoSendQueue(
     } else if (res.status === "sent_cod_only") {
       sentCodOnlyCount++;
       processedCount++;
-    } else if (res.status === "skipped_chatted") {
+    } else if (res.status === "skipped_chatted" || res.status === "skipped_manual") {
       skippedCount++;
       processedCount++;
     } else if (
@@ -1398,6 +2129,47 @@ async function resolveRegisteredBuyerJid(normPhone: string): Promise<string> {
   return targetJid;
 }
 
+const inviteTitleCache = new Map<string, { subject: string; fetchedAt: number }>();
+
+function decodeBasicHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;|&#47;/gi, "/")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+async function fetchAllowlistedGroupInviteTitle(inviteCode: string): Promise<string | null> {
+  if (!ALLOWED_HOLD_GROUP_CODES.has(inviteCode)) return null;
+  const now = Date.now();
+  const cached = inviteTitleCache.get(inviteCode);
+  if (cached && now - cached.fetchedAt <= GROUP_CACHE_TTL_MS) {
+    return cached.subject;
+  }
+
+  try {
+    const res = await fetch(`https://chat.whatsapp.com/${encodeURIComponent(inviteCode)}`, {
+      headers: { "User-Agent": "WhatsApp/2.23.20.0" },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const match = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+    if (!match?.[1]) return null;
+    const title = decodeBasicHtmlEntities(match[1]);
+    if (!title || /^whatsapp\s+group\s+invite$/i.test(title)) {
+      return null;
+    }
+    inviteTitleCache.set(inviteCode, { subject: title, fetchedAt: now });
+    return title;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveHoldGroupInvite(
   inviteCode: string,
   ensureJoined: boolean
@@ -1409,8 +2181,10 @@ async function resolveHoldGroupInvite(
     throw new Error("Link grup On Hold tidak diizinkan atau tidak dikenali.");
   }
 
+  const optionMeta = HOLD_ON_HOLD_GROUP_OPTIONS.find((g) => g.inviteCode === inviteCode);
   const now = Date.now();
   let cached = groupInviteCache.get(inviteCode);
+
   if (!cached || now - cached.fetchedAt > GROUP_CACHE_TTL_MS) {
     try {
       const meta = await sock.groupGetInviteInfo(inviteCode);
@@ -1419,16 +2193,65 @@ async function resolveHoldGroupInvite(
       }
       cached = {
         jid: meta.id,
-        subject: (meta.subject || "").trim() || "Grup On Hold",
+        subject: (meta.subject || "").trim() || optionMeta?.label || "Grup On Hold",
         fetchedAt: now,
       };
       groupInviteCache.set(inviteCode, cached);
     } catch (err: any) {
-      const rawMsg = err?.message || String(err);
-      if (rawMsg.includes("410") || rawMsg.includes("404") || rawMsg.toLowerCase().includes("gone")) {
-        throw new Error("Link undangan grup On Hold sudah kedaluwarsa atau dicabut.");
+      // Fallback: resolve title via allowlisted invite page and match against already-joined groups
+      const fetchedTitle = await fetchAllowlistedGroupInviteTitle(inviteCode);
+      const expectedSubject = (fetchedTitle || optionMeta?.label || "").trim();
+      let matchedParticipating: { jid: string; subject: string } | null = null;
+
+      try {
+        const participating = await sock.groupFetchAllParticipating();
+        if (participating && expectedSubject) {
+          const targetNorm = expectedSubject.toLowerCase();
+          for (const [jid, meta] of Object.entries(participating)) {
+            const sub = ((meta as any)?.subject || "").trim();
+            if (sub && sub.toLowerCase() === targetNorm) {
+              matchedParticipating = { jid, subject: sub };
+              confirmedJoinedGroups.add(jid);
+              break;
+            }
+          }
+        }
+      } catch {
+        // Ignore participating lookup fallback failure
       }
-      throw new Error(`Gagal memeriksa grup On Hold: ${rawMsg}`);
+
+      if (matchedParticipating) {
+        cached = {
+          jid: matchedParticipating.jid,
+          subject: matchedParticipating.subject,
+          fetchedAt: now,
+        };
+        groupInviteCache.set(inviteCode, cached);
+      } else if (ensureJoined) {
+        // Last resort when actually sending: attempt groupAcceptInvite directly
+        try {
+          const joinedJid = await sock.groupAcceptInvite(inviteCode);
+          if (joinedJid) {
+            cached = {
+              jid: joinedJid,
+              subject: expectedSubject || "Grup On Hold",
+              fetchedAt: now,
+            };
+            groupInviteCache.set(inviteCode, cached);
+            confirmedJoinedGroups.add(joinedJid);
+          }
+        } catch {
+          // Handled below
+        }
+      }
+
+      if (!cached) {
+        const rawMsg = err?.message || String(err);
+        if (rawMsg.includes("410") || rawMsg.includes("404") || rawMsg.toLowerCase().includes("gone")) {
+          throw new Error("Link undangan grup On Hold sudah kedaluwarsa atau dicabut.");
+        }
+        throw new Error(`Gagal memeriksa grup On Hold: ${rawMsg}`);
+      }
     }
   }
 
@@ -1478,6 +2301,27 @@ async function resolveHoldGroupInvite(
 
 export async function getHoldGroupsStatus() {
   const isConnected = connectionStatus === "connected" && Boolean(sock);
+  let participatingBySubject: Map<string, { jid: string; subject: string }> | null = null;
+
+  const ensureParticipatingLoaded = async () => {
+    if (participatingBySubject || !isConnected || !sock) return participatingBySubject;
+    participatingBySubject = new Map();
+    try {
+      const participating = await sock.groupFetchAllParticipating();
+      if (participating) {
+        for (const [jid, meta] of Object.entries(participating)) {
+          const sub = ((meta as any)?.subject || "").trim();
+          if (sub) {
+            participatingBySubject.set(sub.toLowerCase(), { jid, subject: sub });
+          }
+        }
+      }
+    } catch {
+      // Ignore participating fetch warning
+    }
+    return participatingBySubject;
+  };
+
   const results = [];
 
   for (const option of HOLD_ON_HOLD_GROUP_OPTIONS) {
@@ -1503,15 +2347,33 @@ export async function getHoldGroupsStatus() {
         });
         continue;
       } catch {
-        // Ignore transient lookup error per group
+        // Fallback to public invite title + participating match below
+      }
+    }
+
+    const fetchedTitle = await fetchAllowlistedGroupInviteTitle(option.inviteCode);
+    const subjectName = (fetchedTitle || option.label).trim();
+    let matchedJid: string | null = null;
+
+    if (isConnected) {
+      const participating = await ensureParticipatingLoaded();
+      const matched = participating?.get(subjectName.toLowerCase());
+      if (matched) {
+        matchedJid = matched.jid;
+        confirmedJoinedGroups.add(matched.jid);
+        groupInviteCache.set(option.inviteCode, {
+          jid: matched.jid,
+          subject: matched.subject,
+          fetchedAt: Date.now(),
+        });
       }
     }
 
     results.push({
       ...option,
-      subject: null,
-      jid: null,
-      resolved: false,
+      subject: subjectName,
+      jid: matchedJid,
+      resolved: Boolean(subjectName),
     });
   }
 

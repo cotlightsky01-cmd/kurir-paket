@@ -22,6 +22,7 @@ export interface Customer {
   waTemplateSent?: boolean; // track if WhatsApp template has been opened once
   waLastTemplateType?: 'titip' | 'cod' | 'nocod'; // track whether user previously chose titip template
   titipLocationName?: string; // drop-off location name if titip template was chosen
+  manualSkipAutoSend?: boolean; // when true, automatic WA sending skips this card
   fillingBatchId?: string; // identifies the Filling session batch for preserving original order on partial sends
   fillingOrder?: number; // original order index inside the Filling batch
 }
@@ -61,8 +62,20 @@ export interface WaGatewayState {
   pairingCode: string | null;
   user: { id: string; name?: string; phone: string } | null;
   knownChatsCount: number;
+  knownSharelocCount?: number;
+  knownHousePhotoCount?: number;
   hasSession: boolean;
   lastError: string | null;
+}
+
+export interface CustomerChatHistoryInfo {
+  phone: string;
+  hasPriorChat: boolean;
+  hasShareloc: boolean;
+  hasHousePhoto: boolean;
+  hasAllLocationProof: boolean;
+  deepChecked?: boolean;
+  checkedAt: number;
 }
 
 export type WaAutoSendItemStatus =
@@ -73,6 +86,7 @@ export type WaAutoSendItemStatus =
   | 'sent_full'
   | 'sent_cod_only'
   | 'skipped_chatted'
+  | 'skipped_manual'
   | 'invalid_phone'
   | 'unregistered'
   | 'failed'

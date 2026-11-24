@@ -21,10 +21,11 @@ import {
   Wifi,
   WifiOff,
   QrCode,
-  X
+  X,
+  SkipForward
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Customer, TempatCodLocation, BulkItem, WaGatewayState, WaAutoSendState, HoldGroupResolvedItem } from './types';
+import { Customer, TempatCodLocation, BulkItem, WaGatewayState, WaAutoSendState, HoldGroupResolvedItem, CustomerChatHistoryInfo } from './types';
 import { BulkProcessorView } from './components/BulkProcessorView';
 import { CustomerCard } from './components/CustomerCard';
 import { SuccessView } from './components/views/SuccessView';
@@ -171,6 +172,8 @@ export default function App() {
   });
   const [showAutoSendBanner, setShowAutoSendBanner] = useState(false);
   const [autoSendCountdownSec, setAutoSendCountdownSec] = useState(0);
+  const [customerChatHistoryMap, setCustomerChatHistoryMap] = useState<Record<string, CustomerChatHistoryInfo>>({});
+  const [checkingWaCustomerId, setCheckingWaCustomerId] = useState<string | null>(null);
   const [holdGroups, setHoldGroups] = useState<HoldGroupResolvedItem[]>(() =>
     HOLD_ON_HOLD_GROUP_OPTIONS.map((g) => ({
       ...g,
@@ -755,6 +758,24 @@ export default function App() {
     setCustomers(prev => prev.filter(c => c.id !== id));
   };
 
+  const toggleManualSkipAutoSend = (id: string) => {
+    setCustomers(prev =>
+      prev.map(c =>
+        c.id === id ? { ...c, manualSkipAutoSend: !c.manualSkipAutoSend } : c
+      )
+    );
+  };
+
+  const handleClearAllManualSkips = () => {
+    setCustomers(prev =>
+      prev.map(c =>
+        c.status === 'modul1' && c.manualSkipAutoSend
+          ? { ...c, manualSkipAutoSend: false }
+          : c
+      )
+    );
+  };
+
   const toggleCustomerCompletedDate = (id: string) => {
     setCustomers(prev => prev.map(c => {
       if (c.id !== id) return c;
@@ -790,8 +811,12 @@ export default function App() {
     localStorage.setItem('kurir_parser_wa_target', next);
   };
 
-  // WhatsApp template chat launcher
-  const handleWhatsAppChat = (customer: Customer, dropOffLocation?: string, isBusinessOverride?: boolean) => {
+  // WhatsApp template chat launcher (checks shareloc & house photo availability before composing)
+  const handleWhatsAppChat = async (
+    customer: Customer,
+    dropOffLocation?: string,
+    isBusinessOverride?: boolean
+  ) => {
     const rawPhone = customer.phone || '';
     const phone = customer.cleanPhone || cleanPhoneNumber(rawPhone);
 
@@ -800,6 +825,49 @@ export default function App() {
       return;
     }
 
+    const cachedHistory = customerChatHistoryMap[phone];
+    let hasShareloc = Boolean(cachedHistory?.hasShareloc);
+    let hasHousePhoto = Boolean(cachedHistory?.hasHousePhoto);
+    const alreadyVerifiedBoth = hasShareloc && hasHousePhoto;
+
+    setCheckingWaCustomerId(customer.id);
+    let timeoutId: number | undefined;
+    try {
+      const controller = new AbortController();
+      timeoutId = window.setTimeout(() => controller.abort(), 5000);
+      const res = await fetch('/api/wa/check-customer-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, deepCheck: !alreadyVerifiedBoth }),
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        hasShareloc = Boolean(data?.hasShareloc);
+        hasHousePhoto = Boolean(data?.hasHousePhoto);
+        setCustomerChatHistoryMap((prev) => ({
+          ...prev,
+          [phone]: {
+            phone,
+            hasPriorChat: Boolean(data?.hasPriorChat),
+            hasShareloc,
+            hasHousePhoto,
+            hasAllLocationProof: hasShareloc && hasHousePhoto,
+            deepChecked: Boolean(data?.deepChecked),
+            checkedAt: Date.now(),
+          },
+        }));
+      }
+    } catch {
+      // Fall back to cachedHistory values if request fails or times out
+    } finally {
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+      setCheckingWaCustomerId((prev) => (prev === customer.id ? null : prev));
+    }
+
+    const hasAllProof = hasShareloc && hasHousePhoto;
     let textToSend = '';
     const roundedCod = getRoundedCodFormatted(customer.cod);
     const isNoCod = parseCodAmount(customer.cod) === 0;
@@ -808,8 +876,52 @@ export default function App() {
     const autoMatchedLoc = dropOffLocation ? null : getMatchingTempatCod(customer.address, tempatCodList);
     const activeDropOffName = dropOffLocation || autoMatchedLoc?.name;
 
-    if (activeDropOffName) {
-      // Automatically use Tempat Titip COD template when a matching location exists or is selected
+    if (dropOffLocation) {
+      // Explicit Titip drop-off location selected by user
+      textToSend = buildVariedTemplateMessage({
+        category: 'titip',
+        template: msgTemplateTitip,
+        customerName: customer.name,
+        codFormatted: roundedCod,
+        isNoCod,
+        titipLocationName: dropOffLocation,
+        customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+        sequenceIndex: customer.originalIndex,
+      });
+
+      setCustomers(prev => prev.map(c => c.id === customer.id ? {
+        ...c,
+        waTemplateSent: true,
+        waLastTemplateType: 'titip',
+        titipLocationName: dropOffLocation
+      } : c));
+    } else if (hasAllProof) {
+      // Shareloc AND house photo both already exist:
+      // - If Non-COD -> open conversation only without adding any template
+      // - If COD -> use varied COD-only template (without requesting shareloc)
+      if (isNoCod) {
+        textToSend = '';
+      } else {
+        const baseAutoCodTpl =
+          (msgTemplateAutoCodOnly || '').trim() || DEFAULT_AUTO_COD_ONLY_TEMPLATE;
+        textToSend = buildVariedTemplateMessage({
+          category: 'cod_only',
+          template: baseAutoCodTpl,
+          customerName: customer.name,
+          codFormatted: roundedCod,
+          isNoCod: false,
+          customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+          sequenceIndex: customer.originalIndex,
+        });
+      }
+
+      setCustomers(prev => prev.map(c => c.id === customer.id ? {
+        ...c,
+        waTemplateSent: true,
+        waLastTemplateType: isNoCod ? 'nocod' : 'cod',
+      } : c));
+    } else if (activeDropOffName) {
+      // Shareloc and/or house photo not yet complete, matched Tempat Titip COD
       textToSend = buildVariedTemplateMessage({
         category: 'titip',
         template: msgTemplateTitip,
@@ -828,37 +940,34 @@ export default function App() {
         titipLocationName: activeDropOffName
       } : c));
     } else {
-      if (!customer.waTemplateSent) {
-        if (isNoCod) {
-          textToSend = buildVariedTemplateMessage({
-            category: 'nocod',
-            template: msgTemplateNoCod,
-            customerName: customer.name,
-            codFormatted: roundedCod,
-            isNoCod: true,
-            customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
-            sequenceIndex: customer.originalIndex,
-          });
-        } else {
-          textToSend = buildVariedTemplateMessage({
-            category: 'cod',
-            template: msgTemplateCod,
-            customerName: customer.name,
-            codFormatted: roundedCod,
-            isNoCod: false,
-            customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
-            sequenceIndex: customer.originalIndex,
-          });
-        }
-        setCustomers(prev => prev.map(c => c.id === customer.id ? {
-          ...c,
-          waTemplateSent: true,
-          waLastTemplateType: isNoCod ? 'nocod' : 'cod',
-          titipLocationName: undefined
-        } : c));
+      // Shareloc and/or house photo not yet complete -> send full varied template anchored to Settings
+      if (isNoCod) {
+        textToSend = buildVariedTemplateMessage({
+          category: 'nocod',
+          template: msgTemplateNoCod,
+          customerName: customer.name,
+          codFormatted: roundedCod,
+          isNoCod: true,
+          customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+          sequenceIndex: customer.originalIndex,
+        });
       } else {
-        textToSend = '';
+        textToSend = buildVariedTemplateMessage({
+          category: 'cod',
+          template: msgTemplateCod,
+          customerName: customer.name,
+          codFormatted: roundedCod,
+          isNoCod: false,
+          customerSeed: `${customer.id}|${customer.phone}|${customer.name}`,
+          sequenceIndex: customer.originalIndex,
+        });
       }
+      setCustomers(prev => prev.map(c => c.id === customer.id ? {
+        ...c,
+        waTemplateSent: true,
+        waLastTemplateType: isNoCod ? 'nocod' : 'cod',
+        titipLocationName: undefined
+      } : c));
     }
 
     const encodedText = textToSend ? encodeURIComponent(textToSend) : '';
@@ -1626,6 +1735,11 @@ export default function App() {
       return;
     }
 
+    if (filteredCustomers.every((c) => c.manualSkipAutoSend)) {
+      alert('Semua kartu di modul Sending ditandai Skip Manual. Matikan minimal 1 Skip Manual untuk memulai kirim otomatis.');
+      return;
+    }
+
     try {
       const payloadItems = filteredCustomers.map((c) => ({
         id: c.id,
@@ -1636,6 +1750,7 @@ export default function App() {
         cod: c.cod,
         waTemplateSent: Boolean(c.waTemplateSent),
         titipLocationName: c.titipLocationName,
+        manualSkipAutoSend: Boolean(c.manualSkipAutoSend),
       }));
 
       const res = await fetch('/api/wa/auto-send/start', {
@@ -1703,6 +1818,7 @@ export default function App() {
         cod: c.cod,
         waTemplateSent: Boolean(c.waTemplateSent),
         titipLocationName: c.titipLocationName,
+        manualSkipAutoSend: Boolean(c.manualSkipAutoSend),
       }));
 
       const res = await fetch('/api/wa/auto-send/resume', {
@@ -1765,6 +1881,50 @@ export default function App() {
       void refreshHoldGroups();
     }
   }, [waGateway.status]);
+
+  // Batch check known shareloc & house photo status for active cards
+  useEffect(() => {
+    const phones = Array.from(
+      new Set(
+        customers
+          .map((c) => c.cleanPhone || cleanPhoneNumber(c.phone || ''))
+          .filter((p) => p && isValidWhatsAppNumber(p))
+      )
+    ).slice(0, 200);
+
+    if (phones.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/wa/check-customers-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phones }),
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (data?.results && typeof data.results === 'object' && !cancelled) {
+          setCustomerChatHistoryMap((prev) => ({
+            ...prev,
+            ...data.results,
+          }));
+        }
+      } catch {
+        // Ignore transient batch check errors
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    customers,
+    waGateway.status,
+    waGateway.knownChatsCount,
+    waGateway.knownSharelocCount,
+    waGateway.knownHousePhotoCount,
+  ]);
 
   // Poll status while QR/pairing modal is open or auto-send queue is active
   useEffect(() => {
@@ -2064,6 +2224,8 @@ export default function App() {
               moveToModul3AndCapture={moveToModul3AndCapture}
               returnToModul1={returnToModul1}
               toggleCustomerCompletedDate={toggleCustomerCompletedDate}
+              customerChatHistoryMap={customerChatHistoryMap}
+              checkingWaCustomerId={checkingWaCustomerId}
             />
           ) : (
             /* SENDING (Modul 1) & HOLD (Modul 3) LISTS */
@@ -2142,13 +2304,34 @@ export default function App() {
                         onClick={handleStartAutoSendSending}
                         disabled={filteredCustomers.length === 0}
                         className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-[#C5A059] to-[#D4AF37] hover:brightness-110 disabled:opacity-40 text-black text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
-                        title="Mulai kirim pesan WhatsApp otomatis (jeda 10-20 detik, skip jika sudah pernah chat Non-COD, COD saja tanpa shareloc jika sudah pernah chat)"
+                        title="Mulai kirim pesan WhatsApp otomatis (jeda 10-20 detik, cek riwayat chat & shareloc sebelum kirim, lewati kartu Skip Manual)"
                       >
                         <Play className="w-3 h-3 fill-current" />
                         Mulai Kirim Otomatis
                       </button>
                     )}
                   </div>
+
+                  {/* Manual Skip Counter Pill (when user marks cards to skip) */}
+                  {(() => {
+                    const manualSkipCount = filteredCustomers.filter((c) => c.manualSkipAutoSend).length;
+                    if (manualSkipCount === 0) return null;
+                    return (
+                      <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-sky-500/10 border border-sky-500/30 text-[10px] text-sky-200">
+                        <span className="flex items-center gap-1.5 font-semibold truncate">
+                          <SkipForward className="w-3 h-3 text-sky-400 shrink-0" />
+                          <span>{manualSkipCount} kartu ditandai Skip Manual (akan dilompati)</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleClearAllManualSkips}
+                          className="px-2 py-0.5 rounded bg-sky-500/20 hover:bg-sky-500/30 text-sky-200 border border-sky-500/30 text-[9px] font-bold shrink-0 cursor-pointer"
+                        >
+                          Reset Skip
+                        </button>
+                      </div>
+                    );
+                  })()}
 
                   {/* Auto-Send Live Progress & Result Summary Banner */}
                   {showAutoSendBanner && waAutoSend.phase !== 'idle' && (
@@ -2249,7 +2432,10 @@ export default function App() {
                             moveToModul2={moveToModul2}
                             moveToModul3AndCapture={moveToModul3AndCapture}
                             returnToModul1={returnToModul1}
+                            toggleManualSkipAutoSend={activeTab === 'modul1' ? toggleManualSkipAutoSend : undefined}
                             autoSendItem={activeTab === 'modul1' ? waAutoSend.items[cust.id] : undefined}
+                            chatHistory={customerChatHistoryMap[cust.cleanPhone || cleanPhoneNumber(cust.phone || '')]}
+                            isCheckingWa={checkingWaCustomerId === cust.id}
                           />
                         );
                       });

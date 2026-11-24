@@ -628,9 +628,7 @@ export const LiveCameraModal: React.FC<LiveCameraModalProps> = ({
                         >
                           {resolvedGroupList.map((group, idx) => (
                             <option key={group.id} value={group.url}>
-                              {group.resolved && group.subject
-                                ? `${idx + 1}. ${group.subject}`
-                                : `${group.label} (${group.inviteCode.slice(0, 8)}...)`}
+                              {`${idx + 1}. ${group.subject || group.label}`}
                             </option>
                           ))}
                         </select>
@@ -638,8 +636,11 @@ export const LiveCameraModal: React.FC<LiveCameraModalProps> = ({
                     </div>
 
                     {activeHoldGroup && (
-                      <p className="text-[9px] text-neutral-500 truncate font-mono">
-                        Link aktif: {activeHoldGroup.url}
+                      <p className="text-[9px] text-sky-300/90 truncate font-medium">
+                        Grup terpilih:{' '}
+                        <span className="font-bold text-white">
+                          {activeHoldGroup.subject || activeHoldGroup.label}
+                        </span>
                       </p>
                     )}
                   </div>

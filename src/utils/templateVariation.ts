@@ -66,7 +66,26 @@ const BODY_PHRASE_RULES: PhraseRule[] = [
     ],
   },
   {
-    pattern: /\b(?:sudah\s+)?kami titipkan di\b/gi,
+    pattern: /\b(?:mau|akan|sedang|siap)\s+(?:kami|saya)\s+(?:antar(?:kan)?|kirim(?:kan)?)\b/gi,
+    variants: () => [
+      'mau kami antar',
+      'akan saya antarkan',
+      'siap kami kirim',
+      'sedang kami antar',
+      'mau saya antarkan',
+    ],
+  },
+  {
+    pattern: /\b(?:mau|akan|sedang|siap)\s+di\s*(?:antar(?:kan)?|kirim(?:kan)?)\b/gi,
+    variants: () => [
+      'mau diantar',
+      'akan segera diantar',
+      'siap diantarkan',
+      'sedang dalam pengantaran',
+    ],
+  },
+  {
+    pattern: /\b(?:sudah\s+)?(?:kami|saya)\s+titipkan\s+di\b/gi,
     variants: () => [
       'sudah kami titipkan di',
       'kami titipkan di',
@@ -104,6 +123,15 @@ const BODY_PHRASE_RULES: PhraseRule[] = [
     ],
   },
   {
+    pattern: /\buang\s+pas\b/gi,
+    variants: () => [
+      'uang pas',
+      'uang pasnya',
+      'nominal pas',
+      'pembayaran pas',
+    ],
+  },
+  {
     pattern: /\bMohon dapat diambil\b/gi,
     variants: () => [
       'Mohon dapat diambil',
@@ -113,12 +141,22 @@ const BODY_PHRASE_RULES: PhraseRule[] = [
     ],
   },
   {
-    pattern: /\b(?:mohon|tolong|harap)\s+(?:kirim(?:kan)?\s+)?(?:share\s*loc(?:k)?|sharelock|sharelokasi)\b/gi,
+    pattern: /\b(?:mohon|tolong|harap|bisa|boleh)\s+(?:bantu\s+)?(?:kirim(?:kan)?|share)\s*(?:share\s*loc(?:k)?|sharelock|sharelokasi|lokasi|titik(?:\s+lokasi)?)\b/gi,
     variants: () => [
       'mohon kirim shareloc',
       'tolong kirimkan shareloc',
       'boleh dibantu kirim shareloc',
-      'mohon bantu kirim shareloc',
+      'mohon bantu kirim share lokasi',
+      'silakan kirimkan titik lokasinya',
+    ],
+  },
+  {
+    pattern: /\b(?:share\s*loc(?:k)?|sharelock|sharelokasi)\b/gi,
+    variants: () => [
+      'shareloc',
+      'share lokasi',
+      'titik lokasi',
+      'shareloc-nya',
     ],
   },
   {
@@ -148,6 +186,33 @@ const BODY_PHRASE_RULES: PhraseRule[] = [
       'paket milik kakak',
     ],
   },
+  {
+    pattern: /\bpaketnya\b/gi,
+    variants: () => [
+      'paketnya',
+      'paket kakak',
+      'kirimannya',
+      'paket Anda',
+    ],
+  },
+  {
+    pattern: /\bsudah\s+sampai\b/gi,
+    variants: () => [
+      'sudah sampai',
+      'telah tiba',
+      'sudah tiba',
+      'sudah sampai tujuan',
+    ],
+  },
+  {
+    pattern: /\bkonfirmasi\b/gi,
+    variants: () => [
+      'konfirmasi',
+      'kabari',
+      'info kembali',
+      'balas pesan ini',
+    ],
+  },
 ];
 
 function safePick<T>(arr: readonly T[], index: number): T {
@@ -161,8 +226,26 @@ function applyGreetingVariation(
   variantNum: number,
   timeOfDay: string
 ): { text: string; matched: boolean } {
+  const salaamMatch = text.match(
+    /^(assalamu\s*['’]?\s*alaikum(?:\s+wr\.?\s*wb\.?)?)\b/i
+  );
+  if (salaamMatch) {
+    const options = [
+      salaamMatch[1],
+      "Assalamu'alaikum kak",
+      "Assalamu'alaikum, permisi",
+      "Assalamu'alaikum, izin info",
+      "Assalamu'alaikum, halo",
+    ];
+    const chosen = safePick(options, variantNum);
+    return {
+      text: chosen + text.slice(salaamMatch[0].length),
+      matched: true,
+    };
+  }
+
   const greetingWithKakMatch = text.match(
-    /^(permisi|halo|hallo|selamat\s+(?:pagi|siang|sore|malam)|mohon\s+izin|izin\s+info)\s+(kak(?:ak)?|mbak|mas|bu|pak)\b/i
+    /^(permisi|halo|hallo|hai|selamat\s+(?:pagi|siang|sore|malam)|mohon\s+izin|izin\s+info|maaf\s+mengganggu)\s+(kak(?:ak)?|mbak|mas|bu|pak)\b/i
   );
 
   if (greetingWithKakMatch) {
@@ -183,7 +266,7 @@ function applyGreetingVariation(
   }
 
   const greetingOnlyMatch = text.match(
-    /^(permisi|halo|hallo|selamat\s+(?:pagi|siang|sore|malam))\b/i
+    /^(permisi|halo|hallo|hai|selamat\s+(?:pagi|siang|sore|malam)|izin\s+info|mohon\s+izin)\b/i
   );
   if (greetingOnlyMatch) {
     const options = [
@@ -221,8 +304,10 @@ function applyGreetingVariation(
   return { text, matched: false };
 }
 
-function applyClosingVariation(text: string, variantNum: number): string {
-  const closingMatch = text.match(/(?:,\s*|\.\s*|\s+)(terima\s*kasih(?:\s+(?:banyak|ya|kak|sebelumnya))*)\.?$/i);
+function applyClosingVariation(text: string, variantNum: number): { text: string; matched: boolean } {
+  const closingMatch = text.match(
+    /(?:,\s*|\.\s*|\s+)((?:terima\s*kasih|terimakasih|makasih)(?:\s+(?:banyak|ya|kak|sebelumnya))*)\.?$/i
+  );
   if (closingMatch) {
     const rawMatched = closingMatch[0];
     const separatorMatch = rawMatched.match(/^([,.\s]+)/);
@@ -234,29 +319,37 @@ function applyClosingVariation(text: string, variantNum: number): string {
       'terima kasih ya kak.',
       'terima kasih sebelumnya.',
       'terima kasih ya.',
+      'makasih banyak ya kak.',
     ];
     const chosenRaw = safePick(rawOptions, variantNum);
     const chosen = startsUpper
       ? chosenRaw.charAt(0).toUpperCase() + chosenRaw.slice(1)
       : chosenRaw;
-    return text.slice(0, text.length - rawMatched.length) + sep + chosen;
+    return {
+      text: text.slice(0, text.length - rawMatched.length) + sep + chosen,
+      matched: true,
+    };
   }
 
   // Gentle trailing particle variation if ending with "ya." or "ya"
   const yaMatch = text.match(/\bya(\.?)$/i);
   if (yaMatch) {
-    const yaOptions = ['ya.', 'ya kak.', 'ya, terima kasih.', 'ya kak, terima kasih.'];
+    const yaOptions = ['ya.', 'ya kak.', 'ya, terima kasih.', 'ya kak, terima kasih.', 'ya, makasih.'];
     const chosen = safePick(yaOptions, variantNum);
-    return text.slice(0, text.length - yaMatch[0].length) + chosen;
+    return {
+      text: text.slice(0, text.length - yaMatch[0].length) + chosen,
+      matched: true,
+    };
   }
 
-  return text;
+  return { text, matched: false };
 }
 
 function renderSingleVariant(
   template: string,
   params: BuildVariedTemplateParams,
-  attemptSeed: number
+  attemptSeed: number,
+  forceExtraDiff = false
 ): { message: string; skeleton: string } {
   const nowMs = params.nowMs ?? Date.now();
   const timeOfDay = getTimeOfDayGreeting(nowMs);
@@ -306,11 +399,12 @@ function renderSingleVariant(
   // Fallback subtle prefix when custom template had no standard greeting
   if (!greetingResult.matched && skeleton.length > 0) {
     const prefixes = [
-      '',
       'Permisi kak, ',
       'Halo kak, ',
       `Selamat ${timeOfDay} kak, `,
       'Izin info kak, ',
+      'Mohon izin kak, ',
+      '',
     ];
     const prefix = safePick(prefixes, attemptSeed);
     if (prefix) {
@@ -319,13 +413,30 @@ function renderSingleVariant(
   }
 
   // Slight natural particle variation between "ya." / "ya kak." if still intact inside sentence
-  if ((attemptSeed % 3) === 1) {
+  if (attemptSeed % 3 === 1) {
     skeleton = skeleton.replace(/\s+ya\.(?=\s+[A-Z])/i, ' ya kak.');
-  } else if ((attemptSeed % 3) === 2) {
+  } else if (attemptSeed % 3 === 2) {
     skeleton = skeleton.replace(/\s+ya\s+kak\.(?=\s+[A-Z])/i, ' ya.');
   }
 
-  skeleton = applyClosingVariation(skeleton, attemptSeed >>> 1);
+  const closingRes = applyClosingVariation(skeleton, attemptSeed >>> 1);
+  skeleton = closingRes.text;
+
+  // If custom template had neither a recognized closing nor enough phrase rules,
+  // apply a gentle polite ending variant so consecutive messages still differ naturally.
+  if ((!closingRes.matched && ruleStep === 0) || forceExtraDiff) {
+    const softClosers = [
+      ' ya kak.',
+      ', terima kasih.',
+      ', mohon konfirmasinya ya.',
+      ', terima kasih sebelumnya.',
+      '.',
+    ];
+    const trimmed = skeleton.replace(/[.!?\s]+$/, '');
+    if (!/(?:terima\s*kasih|makasih|ya\s+kak|konfirmasinya)$/i.test(trimmed)) {
+      skeleton = trimmed + safePick(softClosers, attemptSeed + 5);
+    }
+  }
 
   // Replace template placeholders cleanly
   const effectiveCod =
@@ -345,8 +456,8 @@ function renderSingleVariant(
 
 /**
  * Generates a message anchored strictly to the user's Settings template,
- * ensuring every customer receives slightly varied, natural Indonesian phrasing
- * without drifting away from the configured template structure.
+ * ensuring every customer (both automated and manual mode) receives slightly varied,
+ * natural Indonesian phrasing without drifting away from the configured template structure.
  */
 export function buildVariedTemplateMessage(params: BuildVariedTemplateParams): string {
   const baseSeedStr = `${params.category}|${params.customerSeed || params.customerName}|${params.sequenceIndex ?? 0}`;
@@ -357,10 +468,15 @@ export function buildVariedTemplateMessage(params: BuildVariedTemplateParams): s
   let chosenMessage = '';
   let chosenSkeleton = '';
 
-  // Try up to 12 distinct offsets so consecutive sends never reuse the same template phrasing
-  for (let offset = 0; offset < 12; offset++) {
+  // Try up to 18 distinct offsets so consecutive sends (auto or manual) never reuse the same template phrasing
+  for (let offset = 0; offset < 18; offset++) {
     const attemptSeed = (baseHash + counterSalt * 7 + offset * 13) >>> 0;
-    const candidate = renderSingleVariant(params.template, params, attemptSeed);
+    const candidate = renderSingleVariant(
+      params.template,
+      params,
+      attemptSeed,
+      offset >= 12
+    );
     chosenMessage = candidate.message;
     chosenSkeleton = candidate.skeleton;
     if (!recentList.includes(candidate.skeleton)) {
@@ -369,7 +485,7 @@ export function buildVariedTemplateMessage(params: BuildVariedTemplateParams): s
   }
 
   recentList.push(chosenSkeleton);
-  if (recentList.length > 6) {
+  if (recentList.length > 10) {
     recentList.shift();
   }
   recentSkeletonsByCategory[params.category] = recentList;

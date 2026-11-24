@@ -156,8 +156,8 @@ export const WAAutoConnectModal: React.FC<WAAutoConnectModalProps> = ({
                   </div>
                   <p className="text-[10px] text-neutral-400 truncate font-mono">
                     {gateway.status === 'connected' && gateway.user
-                      ? `${gateway.user.name || 'WA'} (${gateway.user.phone}) • ${gateway.knownChatsCount} riwayat chat`
-                      : `${gateway.knownChatsCount} riwayat chat tersimpan`}
+                      ? `${gateway.user.name || 'WA'} (${gateway.user.phone}) • ${gateway.knownChatsCount} chat • ${gateway.knownSharelocCount ?? 0} loc • ${gateway.knownHousePhotoCount ?? 0} foto`
+                      : `${gateway.knownChatsCount} chat • ${gateway.knownSharelocCount ?? 0} loc • ${gateway.knownHousePhotoCount ?? 0} foto`}
                   </p>
                 </div>
               </div>
@@ -182,13 +182,13 @@ export const WAAutoConnectModal: React.FC<WAAutoConnectModalProps> = ({
                 <div className="p-3 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-[11px] text-emerald-200 space-y-1.5 leading-relaxed">
                   <div className="flex items-center gap-1.5 font-bold text-emerald-300">
                     <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    Siap Kirim Otomatis di Modul Sending
+                    Siap Kirim Otomatis &amp; Cek Manual
                   </div>
                   <ul className="list-disc pl-4 space-y-0.5 text-[10px] text-emerald-200/85">
                     <li>Jeda pengiriman otomatis 10–20 detik antar pesan.</li>
-                    <li>Buyer yang sudah pernah chat (Non-COD) otomatis dilewati.</li>
-                    <li>Buyer sudah pernah chat dengan COD hanya dikirim nominal COD tanpa shareloc.</li>
-                    <li>Buyer belum pernah chat dikirim pesan lengkap.</li>
+                    <li>Kartu yang ditandai <strong>Skip Manual</strong> otomatis dilompati.</li>
+                    <li>Kirim otomatis mengecek riwayat chat &amp; shareloc customer.</li>
+                    <li>Kirim manual mengecek shareloc &amp; foto rumah: jika lengkap &amp; Non-COD hanya buka chat; jika COD hanya kirim acuan COD tanpa minta shareloc.</li>
                   </ul>
                 </div>
 

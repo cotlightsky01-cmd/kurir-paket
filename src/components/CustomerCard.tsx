@@ -12,10 +12,13 @@ import {
   ChevronLeft, 
   Eye, 
   Edit2, 
-  Plus
+  Plus,
+  SkipForward,
+  Loader2,
+  Image as ImageIcon
 } from 'lucide-react';
-import { motion } from 'motion/react';
-import { Customer, TempatCodLocation, WaAutoSendItemResult } from '../types';
+import { motion, useMotionValue, useTransform, animate } from 'motion/react';
+import { Customer, TempatCodLocation, WaAutoSendItemResult, CustomerChatHistoryInfo } from '../types';
 import { 
   getPackageCount, 
   getMatchingTempatCod, 
@@ -48,7 +51,10 @@ interface CustomerCardProps {
   moveToModul3AndCapture: (customer: Customer) => void;
   returnToModul1: (id: string) => void;
   toggleCustomerCompletedDate?: (id: string) => void;
+  toggleManualSkipAutoSend?: (id: string) => void;
   autoSendItem?: WaAutoSendItemResult;
+  chatHistory?: CustomerChatHistoryInfo;
+  isCheckingWa?: boolean;
 }
 
 export const CustomerCard: React.FC<CustomerCardProps> = ({
@@ -74,45 +80,90 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
   moveToModul3AndCapture,
   returnToModul1,
   toggleCustomerCompletedDate,
+  toggleManualSkipAutoSend,
   autoSendItem,
+  chatHistory,
+  isCheckingWa,
 }) => {
   const isModul2Today = cust.status === 'modul2' && isToday(cust.completedAt || cust.timestamp);
   const cardSeqNumber = displayIndex !== undefined ? displayIndex : cust.originalIndex;
+  const hasShareloc = Boolean(chatHistory?.hasShareloc);
+  const hasHousePhoto = Boolean(chatHistory?.hasHousePhoto);
+  const hasAllLocationProof = hasShareloc && hasHousePhoto;
+  const isNoCodCard = parseCodAmount(cust.cod) === 0;
+
+  const SWIPE_TRIGGER_PX = 135;
+  const dragX = useMotionValue(0);
+  const rightActionOpacity = useTransform(dragX, [20, SWIPE_TRIGGER_PX], [0.25, 1]);
+  const leftActionOpacity = useTransform(dragX, [-20, -SWIPE_TRIGGER_PX], [0.25, 1]);
+
+  const snapCardToCenter = () => {
+    animate(dragX, 0, {
+      type: 'spring',
+      stiffness: 500,
+      damping: 34,
+      mass: 0.8,
+    });
+  };
 
   return (
-    <div className="relative group">
+    <div className="relative group overflow-hidden rounded-xl">
       {/* Swipe indication background (dual side underlay) */}
       {activeTab === 'modul1' && (
-        <div className="absolute inset-0 bg-[#1e1e24] rounded-xl flex justify-between items-center px-6 z-0 border border-neutral-800">
-          <span className="text-[10px] font-bold text-emerald-400 flex items-center gap-1">
-            <CheckCircle className="w-3.5 h-3.5" /> Selesai (Success)
-          </span>
-          <span className="text-[10px] font-bold text-amber-500 flex items-center gap-1">
-            Hold (Modul 3) <Camera className="w-3.5 h-3.5" />
-          </span>
+        <div className="absolute inset-0 bg-[#1e1e24] rounded-xl flex justify-between items-center px-5 z-0 border border-neutral-800 pointer-events-none select-none">
+          <motion.span
+            style={{ opacity: rightActionOpacity }}
+            className="text-[10px] font-bold text-emerald-400 flex items-center gap-1"
+          >
+            <CheckCircle className="w-3.5 h-3.5" /> Geser Kuat &rarr; Selesai
+          </motion.span>
+          <motion.span
+            style={{ opacity: leftActionOpacity }}
+            className="text-[10px] font-bold text-amber-500 flex items-center gap-1"
+          >
+            Hold &larr; Geser Kuat <Camera className="w-3.5 h-3.5" />
+          </motion.span>
         </div>
       )}
 
       {/* Card container */}
       <motion.div
-        drag={activeTab === 'modul1' ? "x" : false}
+        drag={activeTab === 'modul1' ? 'x' : false}
         dragDirectionLock
-        dragConstraints={{ left: -140, right: 140 }}
+        dragSnapToOrigin
+        dragElastic={0.15}
+        dragMomentum={false}
+        dragConstraints={{ left: -175, right: 175 }}
         onDragEnd={(_, info) => {
-          if (activeTab === 'modul1') {
-            if (info.offset.x > 80) {
+          const absX = Math.abs(info.offset.x);
+          const absY = Math.abs(info.offset.y);
+          const isIntentionalHorizontalSwipe =
+            absX >= SWIPE_TRIGGER_PX && absX > absY * 1.5;
+
+          if (activeTab === 'modul1' && isIntentionalHorizontalSwipe) {
+            if (info.offset.x >= SWIPE_TRIGGER_PX) {
+              snapCardToCenter();
               moveToModul2(cust.id);
-            } else if (info.offset.x < -80) {
+              return;
+            }
+            if (info.offset.x <= -SWIPE_TRIGGER_PX) {
+              snapCardToCenter();
               moveToModul3AndCapture(cust);
+              return;
             }
           }
+
+          snapCardToCenter();
         }}
-        className={`bg-[#18181B] border rounded-xl p-3 relative z-10 shadow-sm ${
-          cust.status === 'modul2' && isModul2Today
-            ? 'border-emerald-500/30'
-            : 'border-[#232328]'
-        } ${activeTab === 'modul1' ? 'touch-none' : 'touch-pan-y'}`}
-        style={{ x: 0 }}
+        onPointerCancel={snapCardToCenter}
+        className={`border rounded-xl p-3 relative z-10 shadow-sm transition-colors touch-pan-y ${
+          cust.status === 'modul1' && cust.manualSkipAutoSend
+            ? 'bg-[#151821] border-sky-500/40'
+            : cust.status === 'modul2' && isModul2Today
+            ? 'bg-[#18181B] border-emerald-500/30'
+            : 'bg-[#18181B] border-[#232328]'
+        }`}
+        style={{ x: dragX }}
       >
         <div className="flex justify-between items-start gap-2 mb-1.5">
           <div className="flex items-center gap-2">
@@ -130,7 +181,7 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
               </span>
             )}
             {cust.status === 'modul1' && (
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 flex-wrap justify-end">
                 {autoSendItem && (
                   <span
                     className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
@@ -138,7 +189,8 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                         ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                         : autoSendItem.status === 'sent_cod_only'
                         ? 'bg-[#C5A059]/20 text-[#E9D5A6] border-[#C5A059]/40'
-                        : autoSendItem.status === 'skipped_chatted'
+                        : autoSendItem.status === 'skipped_chatted' ||
+                          autoSendItem.status === 'skipped_manual'
                         ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
                         : autoSendItem.status === 'waiting_delay' || autoSendItem.status === 'sending'
                         ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
@@ -156,8 +208,10 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                       ? 'Auto: Lengkap'
                       : autoSendItem.status === 'sent_cod_only'
                       ? 'Auto: COD Saja'
+                      : autoSendItem.status === 'skipped_manual'
+                      ? 'Skip Manual'
                       : autoSendItem.status === 'skipped_chatted'
-                      ? 'Skip (Sudah Chat)'
+                      ? 'Skip (Chat+Loc)'
                       : autoSendItem.status === 'waiting_delay'
                       ? 'Menunggu Jeda...'
                       : autoSendItem.status === 'sending'
@@ -169,6 +223,11 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                       : autoSendItem.status === 'cancelled'
                       ? 'Dihentikan'
                       : 'Gagal / Invalid'}
+                  </span>
+                )}
+                {cust.manualSkipAutoSend && autoSendItem?.status !== 'skipped_manual' && (
+                  <span className="text-[9px] font-bold tracking-wider uppercase px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                    Skip Manual
                   </span>
                 )}
                 <span className="text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/10">
@@ -212,19 +271,38 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                 <div className="flex items-center gap-1">
                   <button 
                     onClick={() => handleWhatsAppChat(cust)}
-                    className={`p-1.5 rounded flex items-center gap-1 transition-all cursor-pointer text-[10px] font-bold ${
-                      cust.waTemplateSent 
+                    disabled={Boolean(isCheckingWa)}
+                    className={`p-1.5 rounded flex items-center gap-1 transition-all cursor-pointer text-[10px] font-bold disabled:opacity-60 ${
+                      hasAllLocationProof
+                        ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 border border-emerald-500/35'
+                        : cust.waTemplateSent 
                         ? 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white border border-neutral-700/50' 
                         : 'bg-[#25D366]/10 text-[#25D366] hover:bg-[#25D366]/20 border border-[#25D366]/20'
                     }`}
-                    title={cust.waTemplateSent ? "Hubungi WA Lagi (Tanpa Template / Chat Bersih)" : "Kirim Pesan WhatsApp (Dengan Template)"}
+                    title={
+                      hasAllLocationProof
+                        ? isNoCodCard
+                          ? "Shareloc & Foto Rumah sudah ada — buka chat tanpa template"
+                          : "Shareloc & Foto Rumah sudah ada — kirim acuan template COD saja"
+                        : cust.waTemplateSent
+                        ? "Belum lengkap (Shareloc / Foto Rumah) — kirim variasi template"
+                        : "Cek Shareloc & Foto Rumah lalu kirim WhatsApp"
+                    }
                   >
-                    <MessageSquare className="w-3.5 h-3.5" />
-                    {cust.waTemplateSent && (
+                    {isCheckingWa ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <MessageSquare className="w-3.5 h-3.5" />
+                    )}
+                    {hasAllLocationProof ? (
+                      <span className="text-[9px] font-bold text-emerald-300 flex items-center gap-0.5">
+                        <Check className="w-2.5 h-2.5 text-emerald-400" /> {isNoCodCard ? 'Chat' : 'COD'}
+                      </span>
+                    ) : cust.waTemplateSent ? (
                       <span className="text-[9px] font-medium text-neutral-400 flex items-center gap-0.5">
                         <Check className="w-2.5 h-2.5 text-green-500" /> Terkirim
                       </span>
-                    )}
+                    ) : null}
                   </button>
 
                   <button 
@@ -239,6 +317,22 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
               )}
             </div>
           </div>
+
+          {/* Shareloc & House Photo Chat History Indicators */}
+          {(hasShareloc || hasHousePhoto) && (
+            <div className="flex justify-end items-center gap-1 flex-wrap">
+              {hasShareloc && (
+                <span className="text-[9px] font-bold text-emerald-300 bg-emerald-500/10 border border-emerald-500/25 px-1.5 py-0.5 rounded flex items-center gap-1">
+                  <MapPin className="w-2.5 h-2.5 text-emerald-400" /> Shareloc
+                </span>
+              )}
+              {hasHousePhoto && (
+                <span className="text-[9px] font-bold text-sky-300 bg-sky-500/10 border border-sky-500/25 px-1.5 py-0.5 rounded flex items-center gap-1">
+                  <ImageIcon className="w-2.5 h-2.5 text-sky-400" /> Foto Rumah
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Address */}
           <div className="flex items-start justify-between gap-4">
@@ -467,6 +561,25 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
           <div className="flex items-center gap-2">
             {cust.status === 'modul1' ? (
               <>
+                {toggleManualSkipAutoSend && (
+                  <button
+                    type="button"
+                    onClick={() => toggleManualSkipAutoSend(cust.id)}
+                    className={`px-2 py-0.5 rounded border text-[9px] font-bold tracking-wide uppercase flex items-center gap-1 transition-all cursor-pointer ${
+                      cust.manualSkipAutoSend
+                        ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 hover:bg-sky-500/30'
+                        : 'bg-neutral-900 text-neutral-400 hover:text-sky-300 border-neutral-800 hover:border-sky-500/30'
+                    }`}
+                    title={
+                      cust.manualSkipAutoSend
+                        ? 'Batalkan skip manual agar ikut kirim otomatis'
+                        : 'Tandai skip manual agar dilompati saat kirim otomatis'
+                    }
+                  >
+                    <SkipForward className="w-2.5 h-2.5" />
+                    {cust.manualSkipAutoSend ? 'Di-skip' : 'Skip'}
+                  </button>
+                )}
                 <button 
                   onClick={() => moveToModul3AndCapture(cust)}
                   className="text-amber-500 hover:text-amber-400 font-bold tracking-wide uppercase transition-all text-[9px] cursor-pointer"

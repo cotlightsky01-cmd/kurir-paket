@@ -1,8 +1,8 @@
 import React from 'react';
 import { Sparkles, RotateCcw, Clock } from 'lucide-react';
-import { Customer, TempatCodLocation } from '../../types';
+import { Customer, TempatCodLocation, CustomerChatHistoryInfo } from '../../types';
 import { CustomerCard } from '../CustomerCard';
-import { formatRupiah, isToday, sumPackageCounts, parseCodAmount, getPackageCount, deduplicateById } from '../../utils/helpers';
+import { formatRupiah, isToday, sumPackageCounts, parseCodAmount, getPackageCount, deduplicateById, cleanPhoneNumber } from '../../utils/helpers';
 
 interface SuccessViewProps {
   filteredCustomers: Customer[];
@@ -29,6 +29,8 @@ interface SuccessViewProps {
   moveToModul3AndCapture: (customer: Customer) => void;
   returnToModul1: (id: string) => void;
   toggleCustomerCompletedDate: (id: string) => void;
+  customerChatHistoryMap?: Record<string, CustomerChatHistoryInfo>;
+  checkingWaCustomerId?: string | null;
 }
 
 export const SuccessView: React.FC<SuccessViewProps> = ({
@@ -56,6 +58,8 @@ export const SuccessView: React.FC<SuccessViewProps> = ({
   moveToModul3AndCapture,
   returnToModul1,
   toggleCustomerCompletedDate,
+  customerChatHistoryMap,
+  checkingWaCustomerId,
 }) => {
   const todayItems = deduplicateById(
     [...filteredCustomers]
@@ -190,6 +194,8 @@ export const SuccessView: React.FC<SuccessViewProps> = ({
                     moveToModul3AndCapture={moveToModul3AndCapture}
                     returnToModul1={returnToModul1}
                     toggleCustomerCompletedDate={toggleCustomerCompletedDate}
+                    chatHistory={customerChatHistoryMap?.[cust.cleanPhone || cleanPhoneNumber(cust.phone || '')]}
+                    isCheckingWa={checkingWaCustomerId === cust.id}
                   />
                 );
               });
@@ -258,6 +264,8 @@ export const SuccessView: React.FC<SuccessViewProps> = ({
                     moveToModul3AndCapture={moveToModul3AndCapture}
                     returnToModul1={returnToModul1}
                     toggleCustomerCompletedDate={toggleCustomerCompletedDate}
+                    chatHistory={customerChatHistoryMap?.[cust.cleanPhone || cleanPhoneNumber(cust.phone || '')]}
+                    isCheckingWa={checkingWaCustomerId === cust.id}
                   />
                 );
               });

@@ -6,6 +6,8 @@ import { GoogleGenAI } from "@google/genai";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getFirestore, doc, onSnapshot, setDoc, getDoc } from "firebase/firestore";
 import {
+  checkBatchCustomerChatRequirements,
+  checkCustomerChatRequirements,
   connectWaGateway,
   getAutoSendState,
   getHoldGroupsStatus,
@@ -737,6 +739,42 @@ async function startServer() {
     });
   });
 
+  app.post("/api/wa/check-customer-history", async (req, res) => {
+    try {
+      const rawPhone =
+        typeof req.body?.phone === "string" ? req.body.phone.trim().slice(0, 40) : "";
+      if (!rawPhone) {
+        return res.status(400).json({ ok: false, error: "Nomor HP pelanggan tidak valid." });
+      }
+      const deepCheck = req.body?.deepCheck !== false;
+      const result = await checkCustomerChatRequirements(rawPhone, { deepCheck });
+      return res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || "Gagal memeriksa riwayat shareloc & foto rumah.",
+      });
+    }
+  });
+
+  app.post("/api/wa/check-customers-batch", (req, res) => {
+    const rawPhones = Array.isArray(req.body?.phones) ? req.body.phones : [];
+    const safePhones = rawPhones
+      .filter((p: unknown): p is string => typeof p === "string" && p.trim().length > 0)
+      .slice(0, 200)
+      .map((p: string) => p.trim().slice(0, 40));
+
+    const results = checkBatchCustomerChatRequirements(safePhones);
+    return res.json({
+      ok: true,
+      results,
+      gateway: getWaGatewayStatus(),
+    });
+  });
+
   const parseAutoSendPayload = (body: any) => {
     const rawItems = Array.isArray(body?.items) ? body.items : [];
     const items: AutoSendInputItem[] = rawItems
@@ -752,6 +790,7 @@ async function startServer() {
         waTemplateSent: Boolean(it.waTemplateSent),
         titipLocationName:
           typeof it.titipLocationName === "string" ? it.titipLocationName.slice(0, 120) : undefined,
+        manualSkipAutoSend: Boolean(it.manualSkipAutoSend),
       }));
 
     const rawTemplates = body?.templates || {};

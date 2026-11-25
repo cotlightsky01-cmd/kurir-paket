@@ -1,7 +1,17 @@
 import path from "path";
 import fs from "fs";
+import zlib from "zlib";
 import QRCode from "qrcode";
 import pino from "pino";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  getDocFromServer,
+  setDoc,
+  type Firestore,
+} from "firebase/firestore";
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -31,6 +41,7 @@ export type AutoSendItemStatus =
   | "sent_cod_only"
   | "skipped_chatted"
   | "skipped_manual"
+  | "skipped_daily_limit"
   | "invalid_phone"
   | "unregistered"
   | "failed"
@@ -70,12 +81,26 @@ export interface AutoSendItemResult {
   templateType?: "titip" | "cod" | "nocod" | "cod_only";
   hasPriorChat?: boolean;
   hasSentShareloc?: boolean;
+  hasHousePhoto?: boolean;
   sentAt?: number;
+}
+
+export interface WaPrecheckStateSnapshot {
+  running: boolean;
+  total: number;
+  completed: number;
+  currentCustomerId: string | null;
+  currentCustomerName: string | null;
+  currentCustomerPhone: string | null;
+  checkedPhones: string[];
+  startedAt: number | null;
+  finishedAt: number | null;
 }
 
 export interface AutoSendStateSnapshot {
   running: boolean;
   phase: "idle" | "checking" | "waiting_delay" | "sending" | "paused" | "completed" | "stopped";
+  isInitialDelay?: boolean;
   total: number;
   processed: number;
   sentFullCount: number;
@@ -94,6 +119,8 @@ export interface AutoSendStateSnapshot {
 
 const AUTH_DIR = path.join(process.cwd(), ".wa-auth");
 const CHAT_INDEX_FILE = path.join(process.cwd(), ".wa-chat-index.json");
+const CHAT_INDEX_BACKUP_FILE = path.join(process.cwd(), ".wa-chat-index.backup.json");
+const MAX_LOCKED_ANCHORS = 6000;
 const MIN_DELAY_MS = 10000;
 const MAX_DELAY_MS = 20000;
 
@@ -145,9 +172,10 @@ const groupInviteCache = new Map<
 >();
 const confirmedJoinedGroups = new Set<string>();
 
-// Auto-send queue state
+// Auto-send queue & background precheck state
 let activeJobToken = 0;
 let lastActualSentAt = 0;
+let activeQueueItemsRef: AutoSendInputItem[] | null = null;
 let pausedJobContext: {
   items: AutoSendInputItem[];
   templates: AutoSendTemplates;
@@ -156,6 +184,7 @@ let pausedJobContext: {
 let autoSendState: AutoSendStateSnapshot = {
   running: false,
   phase: "idle",
+  isInitialDelay: false,
   total: 0,
   processed: 0,
   sentFullCount: 0,
@@ -171,6 +200,68 @@ let autoSendState: AutoSendStateSnapshot = {
   lastError: null,
   items: {},
 };
+
+let precheckToken = 0;
+let precheckState: WaPrecheckStateSnapshot = {
+  running: false,
+  total: 0,
+  completed: 0,
+  currentCustomerId: null,
+  currentCustomerName: null,
+  currentCustomerPhone: null,
+  checkedPhones: [],
+  startedAt: null,
+  finishedAt: null,
+};
+
+export function getTodayJakartaDateKey(now = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jakarta",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+let dailyAutoSentDate = getTodayJakartaDateKey();
+const dailyAutoSentPhones = new Set<string>();
+
+function ensureDailyAutoSentDateCurrent(): boolean {
+  const today = getTodayJakartaDateKey();
+  if (dailyAutoSentDate !== today) {
+    dailyAutoSentDate = today;
+    dailyAutoSentPhones.clear();
+    return true;
+  }
+  return false;
+}
+
+export function hasAutoSentToPhoneToday(rawPhone?: string | null): boolean {
+  const norm = normalizeWaPhone(rawPhone);
+  if (!norm) return false;
+  if (ensureDailyAutoSentDateCurrent()) {
+    scheduleSaveChatIndex();
+  }
+  return dailyAutoSentPhones.has(norm);
+}
+
+export function markPhoneAutoSentToday(rawPhone?: string | null): boolean {
+  const norm = normalizeWaPhone(rawPhone);
+  if (!norm) return false;
+  ensureDailyAutoSentDateCurrent();
+  const alreadyPresent = dailyAutoSentPhones.has(norm);
+  dailyAutoSentPhones.add(norm);
+  // Flush synchronously right after send so crashes/restarts never allow a duplicate send today
+  writeChatIndexToDisk();
+  return !alreadyPresent;
+}
+
+export function getDailyAutoSentPhonesToday(): string[] {
+  if (ensureDailyAutoSentDateCurrent()) {
+    scheduleSaveChatIndex();
+  }
+  return Array.from(dailyAutoSentPhones);
+}
 
 export function normalizeWaPhone(raw?: string | null): string {
   if (!raw || typeof raw !== "string") return "";
@@ -261,70 +352,86 @@ function isValidChatAnchor(anchor: any): anchor is ChatHistoryAnchor {
   );
 }
 
-function loadChatIndexFromDisk() {
-  try {
-    if (!fs.existsSync(CHAT_INDEX_FILE)) return;
-    const raw = fs.readFileSync(CHAT_INDEX_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed?.phones)) {
-      for (const p of parsed.phones) {
-        const norm = normalizeWaPhone(String(p));
-        if (norm.length >= 10) knownChattedPhones.add(norm);
+function mergeChatIndexSnapshot(parsed: any) {
+  if (!parsed || typeof parsed !== "object") return;
+  if (Array.isArray(parsed.phones)) {
+    for (const p of parsed.phones) {
+      const norm = normalizeWaPhone(String(p));
+      if (norm.length >= 10) knownChattedPhones.add(norm);
+    }
+  }
+  if (Array.isArray(parsed.sharelocPhones)) {
+    for (const p of parsed.sharelocPhones) {
+      const norm = normalizeWaPhone(String(p));
+      if (norm.length >= 10) {
+        knownSharelocPhones.add(norm);
+        knownChattedPhones.add(norm);
       }
     }
-    if (Array.isArray(parsed?.sharelocPhones)) {
-      for (const p of parsed.sharelocPhones) {
-        const norm = normalizeWaPhone(String(p));
-        if (norm.length >= 10) {
-          knownSharelocPhones.add(norm);
-          knownChattedPhones.add(norm);
-        }
+  }
+  if (Array.isArray(parsed.housePhotoPhones)) {
+    for (const p of parsed.housePhotoPhones) {
+      const norm = normalizeWaPhone(String(p));
+      if (norm.length >= 10) {
+        knownHousePhotoPhones.add(norm);
+        knownChattedPhones.add(norm);
       }
     }
-    if (Array.isArray(parsed?.housePhotoPhones)) {
-      for (const p of parsed.housePhotoPhones) {
-        const norm = normalizeWaPhone(String(p));
-        if (norm.length >= 10) {
-          knownHousePhotoPhones.add(norm);
-          knownChattedPhones.add(norm);
-        }
+  }
+  if (parsed.lidToPhone && typeof parsed.lidToPhone === "object") {
+    for (const [lid, pn] of Object.entries(parsed.lidToPhone)) {
+      const norm = normalizeWaPhone(String(pn));
+      if (lid && norm.length >= 10) {
+        lidToPhoneMap.set(lid, norm);
       }
     }
-    if (parsed?.lidToPhone && typeof parsed.lidToPhone === "object") {
-      for (const [lid, pn] of Object.entries(parsed.lidToPhone)) {
-        const norm = normalizeWaPhone(String(pn));
-        if (lid && norm.length >= 10) {
-          lidToPhoneMap.set(lid, norm);
-        }
-      }
-    }
-    if (Array.isArray(parsed?.pendingLids)) {
-      for (const l of parsed.pendingLids) {
-        if (typeof l === "string" && l.includes("@lid")) {
+  }
+  if (Array.isArray(parsed.pendingLids)) {
+    for (const l of parsed.pendingLids) {
+      if (typeof l === "string" && l.includes("@lid")) {
+        const mapped = lidToPhoneMap.get(l);
+        if (mapped) {
+          knownChattedPhones.add(mapped);
+        } else {
           pendingChattedLids.add(l);
         }
       }
     }
-    if (Array.isArray(parsed?.pendingSharelocLids)) {
-      for (const l of parsed.pendingSharelocLids) {
-        if (typeof l === "string" && l.includes("@lid")) {
+  }
+  if (Array.isArray(parsed.pendingSharelocLids)) {
+    for (const l of parsed.pendingSharelocLids) {
+      if (typeof l === "string" && l.includes("@lid")) {
+        const mapped = lidToPhoneMap.get(l);
+        if (mapped) {
+          knownSharelocPhones.add(mapped);
+          knownChattedPhones.add(mapped);
+        } else {
           pendingSharelocLids.add(l);
           pendingChattedLids.add(l);
         }
       }
     }
-    if (Array.isArray(parsed?.pendingHousePhotoLids)) {
-      for (const l of parsed.pendingHousePhotoLids) {
-        if (typeof l === "string" && l.includes("@lid")) {
+  }
+  if (Array.isArray(parsed.pendingHousePhotoLids)) {
+    for (const l of parsed.pendingHousePhotoLids) {
+      if (typeof l === "string" && l.includes("@lid")) {
+        const mapped = lidToPhoneMap.get(l);
+        if (mapped) {
+          knownHousePhotoPhones.add(mapped);
+          knownChattedPhones.add(mapped);
+        } else {
           pendingHousePhotoLids.add(l);
           pendingChattedLids.add(l);
         }
       }
     }
-    if (parsed?.anchorsByPhone && typeof parsed.anchorsByPhone === "object") {
-      for (const [phone, anchor] of Object.entries(parsed.anchorsByPhone)) {
-        const norm = normalizeWaPhone(phone);
-        if (norm.length >= 10 && isValidChatAnchor(anchor)) {
+  }
+  if (parsed.anchorsByPhone && typeof parsed.anchorsByPhone === "object") {
+    for (const [phone, anchor] of Object.entries(parsed.anchorsByPhone)) {
+      const norm = normalizeWaPhone(phone);
+      if (norm.length >= 10 && isValidChatAnchor(anchor)) {
+        const existing = oldestChatAnchorByPhone.get(norm);
+        if (!existing || anchor.timestampMs < existing.timestampMs) {
           oldestChatAnchorByPhone.set(norm, {
             key: {
               remoteJid: anchor.key.remoteJid,
@@ -336,22 +443,59 @@ function loadChatIndexFromDisk() {
         }
       }
     }
-    if (parsed?.pendingAnchorsByLid && typeof parsed.pendingAnchorsByLid === "object") {
-      for (const [lid, anchor] of Object.entries(parsed.pendingAnchorsByLid)) {
-        if (lid.includes("@lid") && isValidChatAnchor(anchor)) {
-          pendingAnchorsByLid.set(lid, {
-            key: {
-              remoteJid: anchor.key.remoteJid,
-              fromMe: Boolean(anchor.key.fromMe),
-              id: anchor.key.id,
-            },
-            timestampMs: anchor.timestampMs,
-          });
+  }
+  if (parsed.pendingAnchorsByLid && typeof parsed.pendingAnchorsByLid === "object") {
+    for (const [lid, anchor] of Object.entries(parsed.pendingAnchorsByLid)) {
+      if (lid.includes("@lid") && isValidChatAnchor(anchor)) {
+        const candidate: ChatHistoryAnchor = {
+          key: {
+            remoteJid: anchor.key.remoteJid,
+            fromMe: Boolean(anchor.key.fromMe),
+            id: anchor.key.id,
+          },
+          timestampMs: anchor.timestampMs,
+        };
+        const mapped = lidToPhoneMap.get(lid);
+        if (mapped) {
+          const existing = oldestChatAnchorByPhone.get(mapped);
+          if (!existing || candidate.timestampMs < existing.timestampMs) {
+            oldestChatAnchorByPhone.set(mapped, candidate);
+          }
+        } else {
+          const existing = pendingAnchorsByLid.get(lid);
+          if (!existing || candidate.timestampMs < existing.timestampMs) {
+            pendingAnchorsByLid.set(lid, candidate);
+          }
         }
       }
     }
-  } catch {
-    // Ignore corrupt index file on startup
+  }
+  if (
+    parsed.dailySent &&
+    typeof parsed.dailySent === "object" &&
+    parsed.dailySent.date === getTodayJakartaDateKey() &&
+    Array.isArray(parsed.dailySent.phones)
+  ) {
+    dailyAutoSentDate = parsed.dailySent.date;
+    for (const p of parsed.dailySent.phones) {
+      const norm = normalizeWaPhone(String(p));
+      if (norm.length >= 10) {
+        dailyAutoSentPhones.add(norm);
+      }
+    }
+  }
+}
+
+function loadChatIndexFromDisk() {
+  for (const filePath of [CHAT_INDEX_BACKUP_FILE, CHAT_INDEX_FILE]) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      mergeChatIndexSnapshot(parsed);
+    } catch {
+      // Ignore corrupt index or backup file on startup
+    }
   }
 }
 
@@ -389,29 +533,384 @@ function loadAuthLidMappingsFromDisk() {
   }
 }
 
+function writeJsonAtomicSync(filePath: string, payload: string) {
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, payload, "utf8");
+  fs.renameSync(tmpPath, filePath);
+}
+
+enum FirestoreOperationType {
+  CREATE = "create",
+  UPDATE = "update",
+  DELETE = "delete",
+  LIST = "list",
+  GET = "get",
+  WRITE = "write",
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: FirestoreOperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+  };
+}
+
+let cloudDb: Firestore | null = null;
+let cloudLoadAttempted = false;
+let cloudSyncInFlight = false;
+let cloudSyncQueued = false;
+let cloudQuotaCooldownUntil = 0;
+let cloudSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let lastCloudPhonesSignature = "";
+let lastCloudAnchorsSignature = "";
+let cloudKnownPhonesFloor = 0;
+let cloudKnownSharelocFloor = 0;
+let cloudKnownHousePhotoFloor = 0;
+let cloudKnownAnchorsFloor = 0;
+
+try {
+  const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+  if (fs.existsSync(configPath)) {
+    const firebaseConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    if (firebaseConfig?.projectId) {
+      const firebaseApp = !getApps().length ? initializeApp(firebaseConfig) : getApp();
+      cloudDb =
+        firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== "(default)"
+          ? getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId)
+          : getFirestore(firebaseApp);
+    }
+  }
+} catch {
+  cloudDb = null;
+}
+
+function logCloudFirestoreError(
+  error: unknown,
+  operationType: FirestoreOperationType,
+  docPath: string | null
+) {
+  const message = error instanceof Error ? error.message : String(error);
+  const errInfo: FirestoreErrorInfo = {
+    error: message,
+    operationType,
+    path: docPath,
+    authInfo: { userId: null },
+  };
+  if (message.includes("resource-exhausted") || message.includes("Quota limit exceeded")) {
+    cloudQuotaCooldownUntil = Date.now() + 180_000;
+  }
+  console.warn("[WA Cloud Index] Firestore Error:", JSON.stringify(errInfo));
+}
+
+function compressSnapshotToGzipB64(obj: Record<string, any>): string {
+  const json = JSON.stringify(obj);
+  return zlib.gzipSync(Buffer.from(json, "utf8")).toString("base64");
+}
+
+function decompressSnapshotFromGzipB64(b64: string): any | null {
+  try {
+    const buf = zlib.gunzipSync(Buffer.from(b64, "base64"));
+    return JSON.parse(buf.toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function buildChatIndexSnapshotData() {
+  ensureDailyAutoSentDateCurrent();
+  if (oldestChatAnchorByPhone.size > MAX_LOCKED_ANCHORS) {
+    const kept = Array.from(oldestChatAnchorByPhone.entries()).slice(-MAX_LOCKED_ANCHORS);
+    oldestChatAnchorByPhone.clear();
+    for (const [k, v] of kept) oldestChatAnchorByPhone.set(k, v);
+  }
+  if (pendingAnchorsByLid.size > MAX_LOCKED_ANCHORS) {
+    const keptPending = Array.from(pendingAnchorsByLid.entries()).slice(-MAX_LOCKED_ANCHORS);
+    pendingAnchorsByLid.clear();
+    for (const [k, v] of keptPending) pendingAnchorsByLid.set(k, v);
+  }
+  const anchorsEntries = Array.from(oldestChatAnchorByPhone.entries()).slice(-MAX_LOCKED_ANCHORS);
+  const pendingAnchorEntries = Array.from(pendingAnchorsByLid.entries()).slice(-MAX_LOCKED_ANCHORS);
+  return {
+    phones: Array.from(knownChattedPhones),
+    sharelocPhones: Array.from(knownSharelocPhones),
+    housePhotoPhones: Array.from(knownHousePhotoPhones),
+    lidToPhone: Object.fromEntries(lidToPhoneMap.entries()),
+    pendingLids: Array.from(pendingChattedLids).slice(-MAX_LOCKED_ANCHORS),
+    pendingSharelocLids: Array.from(pendingSharelocLids).slice(-MAX_LOCKED_ANCHORS),
+    pendingHousePhotoLids: Array.from(pendingHousePhotoLids).slice(-MAX_LOCKED_ANCHORS),
+    anchorsByPhone: Object.fromEntries(anchorsEntries),
+    pendingAnchorsByLid: Object.fromEntries(pendingAnchorEntries),
+    anchorLocked: true,
+    maxAnchorsLimit: MAX_LOCKED_ANCHORS,
+    dailySent: {
+      date: dailyAutoSentDate,
+      phones: Array.from(dailyAutoSentPhones),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function getPhonesShardSignature(data: ReturnType<typeof buildChatIndexSnapshotData>): string {
+  return [
+    data.phones.length,
+    data.sharelocPhones.length,
+    data.housePhotoPhones.length,
+    Object.keys(data.lidToPhone).length,
+    data.pendingLids.length,
+    data.pendingSharelocLids.length,
+    data.pendingHousePhotoLids.length,
+    data.dailySent.date,
+    data.dailySent.phones.length,
+  ].join(":");
+}
+
+function getAnchorsShardSignature(data: ReturnType<typeof buildChatIndexSnapshotData>): string {
+  const anchorKeys = Object.keys(data.anchorsByPhone);
+  const firstKey = anchorKeys[0] || "";
+  const lastKey = anchorKeys[anchorKeys.length - 1] || "";
+  return [
+    anchorKeys.length,
+    Object.keys(data.pendingAnchorsByLid).length,
+    firstKey,
+    lastKey,
+    firstKey ? data.anchorsByPhone[firstKey]?.timestampMs || 0 : 0,
+    lastKey ? data.anchorsByPhone[lastKey]?.timestampMs || 0 : 0,
+  ].join(":");
+}
+
+async function syncChatIndexToCloudNow(): Promise<void> {
+  if (!cloudDb || !cloudLoadAttempted) return;
+  if (Date.now() < cloudQuotaCooldownUntil) return;
+  if (cloudSyncInFlight) {
+    cloudSyncQueued = true;
+    return;
+  }
+
+  cloudSyncInFlight = true;
+  try {
+    const data = buildChatIndexSnapshotData();
+    // Never overwrite cloud with empty/shrunk index if cloud already holds more data
+    if (
+      data.phones.length < cloudKnownPhonesFloor ||
+      data.sharelocPhones.length < cloudKnownSharelocFloor ||
+      data.housePhotoPhones.length < cloudKnownHousePhotoFloor
+    ) {
+      return;
+    }
+
+    const phonesSig = getPhonesShardSignature(data);
+    const anchorsSig = getAnchorsShardSignature(data);
+    const nowIso = data.updatedAt;
+
+    if (phonesSig !== lastCloudPhonesSignature && data.phones.length > 0) {
+      const phonesGzipB64 = compressSnapshotToGzipB64({
+        phones: data.phones,
+        sharelocPhones: data.sharelocPhones,
+        housePhotoPhones: data.housePhotoPhones,
+        lidToPhone: data.lidToPhone,
+        pendingLids: data.pendingLids,
+        pendingSharelocLids: data.pendingSharelocLids,
+        pendingHousePhotoLids: data.pendingHousePhotoLids,
+        dailySent: data.dailySent,
+        updatedAt: nowIso,
+      });
+      if (phonesGzipB64.length <= 950_000) {
+        const docPath = "app_data/wa_chat_index_phones";
+        try {
+          await setDoc(doc(cloudDb, "app_data", "wa_chat_index_phones"), {
+            format: "gzip-json-v1",
+            payloadGzipB64: phonesGzipB64,
+            counts: {
+              phones: data.phones.length,
+              shareloc: data.sharelocPhones.length,
+              housePhoto: data.housePhotoPhones.length,
+              lidToPhone: Object.keys(data.lidToPhone).length,
+            },
+            updatedAt: nowIso,
+          });
+          lastCloudPhonesSignature = phonesSig;
+          cloudKnownPhonesFloor = Math.max(cloudKnownPhonesFloor, data.phones.length);
+          cloudKnownSharelocFloor = Math.max(cloudKnownSharelocFloor, data.sharelocPhones.length);
+          cloudKnownHousePhotoFloor = Math.max(
+            cloudKnownHousePhotoFloor,
+            data.housePhotoPhones.length
+          );
+        } catch (err) {
+          logCloudFirestoreError(err, FirestoreOperationType.WRITE, docPath);
+        }
+      }
+    }
+
+    if (
+      anchorsSig !== lastCloudAnchorsSignature &&
+      (Object.keys(data.anchorsByPhone).length >= cloudKnownAnchorsFloor ||
+        Object.keys(data.anchorsByPhone).length > 0)
+    ) {
+      const anchorsGzipB64 = compressSnapshotToGzipB64({
+        anchorsByPhone: data.anchorsByPhone,
+        pendingAnchorsByLid: data.pendingAnchorsByLid,
+        anchorLocked: true,
+        maxAnchorsLimit: MAX_LOCKED_ANCHORS,
+        updatedAt: nowIso,
+      });
+      if (anchorsGzipB64.length <= 950_000) {
+        const docPath = "app_data/wa_chat_index_anchors";
+        try {
+          await setDoc(doc(cloudDb, "app_data", "wa_chat_index_anchors"), {
+            format: "gzip-json-v1",
+            payloadGzipB64: anchorsGzipB64,
+            counts: {
+              anchors: Object.keys(data.anchorsByPhone).length,
+              pendingAnchors: Object.keys(data.pendingAnchorsByLid).length,
+            },
+            updatedAt: nowIso,
+          });
+          lastCloudAnchorsSignature = anchorsSig;
+          cloudKnownAnchorsFloor = Math.max(
+            cloudKnownAnchorsFloor,
+            Object.keys(data.anchorsByPhone).length
+          );
+        } catch (err) {
+          logCloudFirestoreError(err, FirestoreOperationType.WRITE, docPath);
+        }
+      }
+    }
+  } finally {
+    cloudSyncInFlight = false;
+    if (cloudSyncQueued) {
+      cloudSyncQueued = false;
+      scheduleCloudIndexSync(3000);
+    }
+  }
+}
+
+function scheduleCloudIndexSync(delayMs = 6000) {
+  if (!cloudDb || !cloudLoadAttempted) return;
+  if (cloudSyncTimer) return;
+  cloudSyncTimer = setTimeout(() => {
+    cloudSyncTimer = null;
+    void syncChatIndexToCloudNow();
+  }, delayMs);
+}
+
+async function initCloudChatIndexSyncOnBoot(): Promise<void> {
+  if (!cloudDb) {
+    cloudLoadAttempted = true;
+    return;
+  }
+
+  let cloudPhonesSig = "";
+  let cloudAnchorsSig = "";
+
+  for (const docId of ["wa_chat_index_phones", "wa_chat_index_anchors"]) {
+    const docPath = `app_data/${docId}`;
+    try {
+      let snap;
+      try {
+        snap = await getDocFromServer(doc(cloudDb, "app_data", docId));
+      } catch {
+        snap = await getDoc(doc(cloudDb, "app_data", docId));
+      }
+      if (snap.exists()) {
+        const docData = snap.data();
+        if (docData?.format === "gzip-json-v1" && typeof docData.payloadGzipB64 === "string") {
+          const decoded = decompressSnapshotFromGzipB64(docData.payloadGzipB64);
+          if (decoded) {
+            if (docId === "wa_chat_index_phones") {
+              const cloudPhonesLen = Array.isArray(decoded.phones) ? decoded.phones.length : 0;
+              const cloudSharelocLen = Array.isArray(decoded.sharelocPhones)
+                ? decoded.sharelocPhones.length
+                : 0;
+              const cloudPhotoLen = Array.isArray(decoded.housePhotoPhones)
+                ? decoded.housePhotoPhones.length
+                : 0;
+              cloudKnownPhonesFloor = Math.max(cloudKnownPhonesFloor, cloudPhonesLen);
+              cloudKnownSharelocFloor = Math.max(cloudKnownSharelocFloor, cloudSharelocLen);
+              cloudKnownHousePhotoFloor = Math.max(cloudKnownHousePhotoFloor, cloudPhotoLen);
+              cloudPhonesSig = [
+                cloudPhonesLen,
+                cloudSharelocLen,
+                cloudPhotoLen,
+                decoded.lidToPhone ? Object.keys(decoded.lidToPhone).length : 0,
+                Array.isArray(decoded.pendingLids) ? decoded.pendingLids.length : 0,
+                Array.isArray(decoded.pendingSharelocLids) ? decoded.pendingSharelocLids.length : 0,
+                Array.isArray(decoded.pendingHousePhotoLids)
+                  ? decoded.pendingHousePhotoLids.length
+                  : 0,
+                decoded.dailySent?.date || "",
+                Array.isArray(decoded.dailySent?.phones) ? decoded.dailySent.phones.length : 0,
+              ].join(":");
+            } else {
+              const cloudAnchorsObj =
+                decoded.anchorsByPhone && typeof decoded.anchorsByPhone === "object"
+                  ? decoded.anchorsByPhone
+                  : {};
+              const anchorKeys = Object.keys(cloudAnchorsObj);
+              const firstKey = anchorKeys[0] || "";
+              const lastKey = anchorKeys[anchorKeys.length - 1] || "";
+              cloudKnownAnchorsFloor = Math.max(cloudKnownAnchorsFloor, anchorKeys.length);
+              cloudAnchorsSig = [
+                anchorKeys.length,
+                decoded.pendingAnchorsByLid ? Object.keys(decoded.pendingAnchorsByLid).length : 0,
+                firstKey,
+                lastKey,
+                firstKey ? cloudAnchorsObj[firstKey]?.timestampMs || 0 : 0,
+                lastKey ? cloudAnchorsObj[lastKey]?.timestampMs || 0 : 0,
+              ].join(":");
+            }
+            mergeChatIndexSnapshot(decoded);
+          }
+        }
+      }
+    } catch (err) {
+      logCloudFirestoreError(err, FirestoreOperationType.GET, docPath);
+    }
+  }
+
+  cloudLoadAttempted = true;
+
+  // Persist merged local+cloud superset back to disk without losing anything
+  writeChatIndexToDisk(true);
+
+  const mergedSnapshot = buildChatIndexSnapshotData();
+  const mergedPhonesSig = getPhonesShardSignature(mergedSnapshot);
+  const mergedAnchorsSig = getAnchorsShardSignature(mergedSnapshot);
+  lastCloudPhonesSignature = cloudPhonesSig;
+  lastCloudAnchorsSignature = cloudAnchorsSig;
+
+  if (
+    (mergedSnapshot.phones.length > 0 && mergedPhonesSig !== cloudPhonesSig) ||
+    (Object.keys(mergedSnapshot.anchorsByPhone).length > 0 && mergedAnchorsSig !== cloudAnchorsSig)
+  ) {
+    await syncChatIndexToCloudNow();
+  }
+}
+
+function writeChatIndexToDisk(skipCloudSchedule = false) {
+  if (saveIndexTimer) {
+    clearTimeout(saveIndexTimer);
+    saveIndexTimer = null;
+  }
+  try {
+    const data = buildChatIndexSnapshotData();
+    const serialized = JSON.stringify(data);
+    writeJsonAtomicSync(CHAT_INDEX_FILE, serialized);
+    writeJsonAtomicSync(CHAT_INDEX_BACKUP_FILE, serialized);
+  } catch {
+    // Ignore disk write failure
+  }
+  if (!skipCloudSchedule) {
+    scheduleCloudIndexSync(6000);
+  }
+}
+
 function scheduleSaveChatIndex() {
   if (saveIndexTimer) return;
   saveIndexTimer = setTimeout(() => {
     saveIndexTimer = null;
-    try {
-      const anchorsEntries = Array.from(oldestChatAnchorByPhone.entries()).slice(-2000);
-      const pendingAnchorEntries = Array.from(pendingAnchorsByLid.entries()).slice(-2000);
-      const data = {
-        phones: Array.from(knownChattedPhones),
-        sharelocPhones: Array.from(knownSharelocPhones),
-        housePhotoPhones: Array.from(knownHousePhotoPhones),
-        lidToPhone: Object.fromEntries(lidToPhoneMap.entries()),
-        pendingLids: Array.from(pendingChattedLids).slice(-2000),
-        pendingSharelocLids: Array.from(pendingSharelocLids).slice(-2000),
-        pendingHousePhotoLids: Array.from(pendingHousePhotoLids).slice(-2000),
-        anchorsByPhone: Object.fromEntries(anchorsEntries),
-        pendingAnchorsByLid: Object.fromEntries(pendingAnchorEntries),
-        updatedAt: new Date().toISOString(),
-      };
-      fs.writeFileSync(CHAT_INDEX_FILE, JSON.stringify(data), "utf8");
-    } catch {
-      // Ignore disk write failure
-    }
+    writeChatIndexToDisk();
   }, 500);
 }
 
@@ -798,6 +1297,8 @@ export function getWaGatewayStatus() {
     knownChatsCount: knownChattedPhones.size,
     knownSharelocCount: knownSharelocPhones.size,
     knownHousePhotoCount: knownHousePhotoPhones.size,
+    lockedAnchorsCount: Math.min(oldestChatAnchorByPhone.size, MAX_LOCKED_ANCHORS),
+    maxAnchorsLimit: MAX_LOCKED_ANCHORS,
     hasSession: hasAuthSessionFiles(),
     lastError: lastConnectionError,
   };
@@ -910,6 +1411,9 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
           currentPairingCode = null;
           lastConnectionError = "Sesi WhatsApp logout. Silakan scan QR atau pairing ulang.";
           stopAutoSendQueue("Sesi WhatsApp terputus (logout).");
+          // Lock & flush all captured anchors and chat history locally + to Firestore before clearing auth folder
+          writeChatIndexToDisk(true);
+          void syncChatIndexToCloudNow();
           try {
             if (fs.existsSync(AUTH_DIR)) {
               fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -921,6 +1425,8 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
         }
 
         if (manualDisconnect) {
+          writeChatIndexToDisk(true);
+          void syncChatIndexToCloudNow();
           connectionStatus = "disconnected";
           return;
         }
@@ -987,6 +1493,10 @@ export async function connectWaGateway(): Promise<ReturnType<typeof getWaGateway
         for (const msg of messages) {
           inspectChatHistoryMessage(msg);
         }
+      }
+      // Lock newly synced anchors & history to disk immediately per chunk
+      if (saveIndexTimer) {
+        writeChatIndexToDisk();
       }
       notifyHistorySyncListeners();
     });
@@ -1104,6 +1614,7 @@ export async function requestWaPairingCode(rawPhone: string): Promise<{ code: st
 
 export async function logoutWaGateway(): Promise<ReturnType<typeof getWaGatewayStatus>> {
   manualDisconnect = true;
+  stopPrecheckCustomers();
   stopAutoSendQueue("Koneksi WhatsApp diputus oleh pengguna.");
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -1130,11 +1641,12 @@ export async function logoutWaGateway(): Promise<ReturnType<typeof getWaGatewayS
   lastConnectionError = null;
   groupInviteCache.clear();
   confirmedJoinedGroups.clear();
-  oldestChatAnchorByPhone.clear();
-  pendingAnchorsByLid.clear();
+  // Lock anchors, pending LID anchors, chat history index, and daily send protection across logout/re-pairing
   deepHistoryCheckedAt.clear();
   onWhatsAppLidCheckedAt.clear();
   historySyncListeners.clear();
+  writeChatIndexToDisk(true);
+  void syncChatIndexToCloudNow();
 
   try {
     if (fs.existsSync(AUTH_DIR)) {
@@ -1148,6 +1660,7 @@ export async function logoutWaGateway(): Promise<ReturnType<typeof getWaGatewayS
 }
 
 export function initWaGatewayOnBoot() {
+  void initCloudChatIndexSyncOnBoot();
   if (hasAuthSessionFiles()) {
     void connectWaGateway();
   }
@@ -1166,6 +1679,7 @@ function isTerminalAutoSendStatus(status?: AutoSendItemStatus): boolean {
     status === "sent_cod_only" ||
     status === "skipped_chatted" ||
     status === "skipped_manual" ||
+    status === "skipped_daily_limit" ||
     status === "invalid_phone" ||
     status === "unregistered" ||
     status === "failed"
@@ -1178,9 +1692,11 @@ function isQueuePaused(): boolean {
 
 export function pauseAutoSendQueue(reason?: string): AutoSendStateSnapshot {
   activeJobToken++;
+  activeQueueItemsRef = null;
   if (autoSendState.running) {
     autoSendState.running = false;
     autoSendState.phase = "paused";
+    autoSendState.isInitialDelay = false;
     autoSendState.nextSendAt = null;
     autoSendState.delaySeconds = null;
     autoSendState.lastError = reason || null;
@@ -1200,10 +1716,12 @@ export function pauseAutoSendQueue(reason?: string): AutoSendStateSnapshot {
 
 export function stopAutoSendQueue(reason?: string): AutoSendStateSnapshot {
   activeJobToken++;
+  activeQueueItemsRef = null;
   pausedJobContext = null;
   if (autoSendState.running || autoSendState.phase === "paused") {
     autoSendState.running = false;
     autoSendState.phase = "stopped";
+    autoSendState.isInitialDelay = false;
     autoSendState.nextSendAt = null;
     autoSendState.delaySeconds = null;
     autoSendState.finishedAt = Date.now();
@@ -1231,10 +1749,12 @@ export function stopAutoSendQueue(reason?: string): AutoSendStateSnapshot {
 
 export function resetAutoSendQueue(): AutoSendStateSnapshot {
   activeJobToken++;
+  activeQueueItemsRef = null;
   pausedJobContext = null;
   autoSendState = {
     running: false,
     phase: "idle",
+    isInitialDelay: false,
     total: 0,
     processed: 0,
     sentFullCount: 0,
@@ -1267,12 +1787,12 @@ async function waitInterruptible(ms: number, token: number): Promise<boolean> {
 
 async function ensureDeepCustomerHistoryChecked(
   normPhone: string,
-  requireHousePhoto = false
+  requireBoth = false
 ): Promise<void> {
   if (!sock || connectionStatus !== "connected") return;
   const hasSharelocNow = knownSharelocPhones.has(normPhone);
   const hasHousePhotoNow = knownHousePhotoPhones.has(normPhone);
-  if (hasSharelocNow && (!requireHousePhoto || hasHousePhotoNow)) return;
+  if (requireBoth ? hasSharelocNow && hasHousePhotoNow : hasSharelocNow || hasHousePhotoNow) return;
 
   const now = Date.now();
   const lastDeepCheck = deepHistoryCheckedAt.get(normPhone) || 0;
@@ -1287,8 +1807,9 @@ async function ensureDeepCustomerHistoryChecked(
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const isSatisfied = () =>
-      knownSharelocPhones.has(normPhone) &&
-      (!requireHousePhoto || knownHousePhotoPhones.has(normPhone));
+      requireBoth
+        ? knownSharelocPhones.has(normPhone) && knownHousePhotoPhones.has(normPhone)
+        : knownSharelocPhones.has(normPhone) || knownHousePhotoPhones.has(normPhone);
 
     const done = () => {
       if (settled) return;
@@ -1420,6 +1941,8 @@ export async function checkCustomerChatRequirements(
     hasPriorChat = knownChattedPhones.has(normPhone);
     hasShareloc = knownSharelocPhones.has(normPhone);
     hasHousePhoto = knownHousePhotoPhones.has(normPhone);
+  } else if (options?.deepCheck !== false && gatewayConnected) {
+    deepHistoryCheckedAt.set(normPhone, Date.now());
   }
 
   return {
@@ -1427,7 +1950,7 @@ export async function checkCustomerChatRequirements(
     hasPriorChat,
     hasShareloc,
     hasHousePhoto,
-    hasAllLocationProof: hasShareloc && hasHousePhoto,
+    hasAllLocationProof: hasShareloc || hasHousePhoto,
     deepChecked: deepHistoryCheckedAt.has(normPhone),
     gatewayConnected,
     checkedAt: Date.now(),
@@ -1452,7 +1975,7 @@ export function checkBatchCustomerChatRequirements(
       hasPriorChat,
       hasShareloc,
       hasHousePhoto,
-      hasAllLocationProof: hasShareloc && hasHousePhoto,
+      hasAllLocationProof: hasShareloc || hasHousePhoto,
       deepChecked: deepHistoryCheckedAt.has(normPhone),
       gatewayConnected,
       checkedAt: now,
@@ -1462,10 +1985,129 @@ export function checkBatchCustomerChatRequirements(
   return results;
 }
 
+export function getPrecheckState(): WaPrecheckStateSnapshot {
+  return {
+    ...precheckState,
+    checkedPhones: [...precheckState.checkedPhones],
+  };
+}
+
+export function stopPrecheckCustomers(): WaPrecheckStateSnapshot {
+  precheckToken++;
+  if (precheckState.running) {
+    precheckState = {
+      ...precheckState,
+      running: false,
+      currentCustomerId: null,
+      currentCustomerName: null,
+      currentCustomerPhone: null,
+      finishedAt: Date.now(),
+    };
+  }
+  return getPrecheckState();
+}
+
+export function startPrecheckCustomers(
+  rawItems: Array<{ id?: string; name?: string; phone: string }>
+): { precheck: WaPrecheckStateSnapshot; results: Record<string, CustomerChatCheckResult> } {
+  const uniquePhoneItems: Array<{ id: string; name: string; phone: string }> = [];
+  const seenPhones = new Set<string>();
+
+  for (const item of rawItems) {
+    const normPhone = normalizeWaPhone(item?.phone);
+    if (!isValidServerWaPhone(normPhone) || seenPhones.has(normPhone)) continue;
+    seenPhones.add(normPhone);
+    uniquePhoneItems.push({
+      id: typeof item?.id === "string" ? item.id : normPhone,
+      name: typeof item?.name === "string" && item.name.trim() ? item.name.trim() : "Pelanggan",
+      phone: normPhone,
+    });
+  }
+
+  const instantResults = checkBatchCustomerChatRequirements(
+    uniquePhoneItems.map((it) => it.phone)
+  );
+
+  // Strictly read-only background scan; never interrupts an active auto-send queue
+  if (
+    uniquePhoneItems.length === 0 ||
+    connectionStatus !== "connected" ||
+    !sock ||
+    autoSendState.running
+  ) {
+    return {
+      precheck: getPrecheckState(),
+      results: instantResults,
+    };
+  }
+
+  const token = ++precheckToken;
+  precheckState = {
+    running: true,
+    total: uniquePhoneItems.length,
+    completed: 0,
+    currentCustomerId: uniquePhoneItems[0]?.id || null,
+    currentCustomerName: uniquePhoneItems[0]?.name || null,
+    currentCustomerPhone: uniquePhoneItems[0]?.phone || null,
+    checkedPhones: [],
+    startedAt: Date.now(),
+    finishedAt: null,
+  };
+
+  void (async () => {
+    for (let i = 0; i < uniquePhoneItems.length; i++) {
+      if (
+        token !== precheckToken ||
+        autoSendState.running ||
+        connectionStatus !== "connected" ||
+        !sock
+      ) {
+        break;
+      }
+      const entry = uniquePhoneItems[i];
+      precheckState.currentCustomerId = entry.id;
+      precheckState.currentCustomerName = entry.name;
+      precheckState.currentCustomerPhone = entry.phone;
+
+      try {
+        await checkCustomerChatRequirements(entry.phone, { deepCheck: true });
+      } catch {
+        // Ignore transient per-customer read errors
+      }
+
+      if (token !== precheckToken || autoSendState.running) {
+        break;
+      }
+      if (!precheckState.checkedPhones.includes(entry.phone)) {
+        precheckState.checkedPhones.push(entry.phone);
+      }
+      precheckState.completed = i + 1;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    if (token === precheckToken) {
+      precheckState = {
+        ...precheckState,
+        running: false,
+        currentCustomerId: null,
+        currentCustomerName: null,
+        currentCustomerPhone: null,
+        finishedAt: Date.now(),
+      };
+    }
+  })();
+
+  return {
+    precheck: getPrecheckState(),
+    results: instantResults,
+  };
+}
+
 function buildAutoMessagesForItem(
   item: AutoSendInputItem,
   hasPriorChat: boolean,
   hasSentShareloc: boolean,
+  hasHousePhoto: boolean,
   templates: AutoSendTemplates,
   tempatCodList: TempatCodItem[],
   itemIndex: number
@@ -1478,14 +2120,16 @@ function buildAutoMessagesForItem(
   const roundedCod = getServerRoundedCodFormatted(item.cod);
   const safeName = (item.name || "Pelanggan").trim();
   const seed = `${item.id}|${item.phone}|${safeName}`;
+  // Once Shareloc OR House Photo (or both) exist in chat, never request shareloc again
+  const hasSufficientLocationProof = hasSentShareloc || hasHousePhoto;
 
-  // Rule 1: Already chatted AND customer already sent shareloc & Non-COD -> skip automatically
-  if (hasPriorChat && hasSentShareloc && codAmount === 0) {
+  // Rule 1: Shareloc and/or House Photo present & Non-COD -> skip automatically (send nothing, mark Terkirim)
+  if (hasSufficientLocationProof && codAmount === 0) {
     return { action: "skip", text: "" };
   }
 
-  // Rule 2: Already chatted AND customer already sent shareloc & COD -> send ONLY COD nominal template
-  if (hasPriorChat && hasSentShareloc && codAmount > 0) {
+  // Rule 2: Shareloc and/or House Photo present & COD -> send ONLY COD nominal template (no shareloc request)
+  if (hasSufficientLocationProof && codAmount > 0) {
     const baseAutoTpl =
       (templates.codOnlyNoShareloc || "").trim() ||
       "Permisi kak {Nama}, hari ini ada paket COD nominal {COD} ya. Mohon disiapkan uang pas, terima kasih.";
@@ -1505,7 +2149,7 @@ function buildAutoMessagesForItem(
     };
   }
 
-  // Rule 3: Never chatted OR already chatted without sending shareloc -> send full template (varied)
+  // Rule 3: Neither Shareloc nor House Photo present -> send full template (need shareloc / delivery info)
   const matchedLoc = item.titipLocationName
     ? { name: item.titipLocationName }
     : getMatchingServerTempatCod(item.address, tempatCodList);
@@ -1567,10 +2211,53 @@ function runAutoSendWorker(
   tempatCodList: TempatCodItem[],
   token: number,
   sequenceOffset: number,
-  initialHasSentAnyMessage: boolean
+  initialHasSentAnyMessage: boolean,
+  initialDelayMs = 0
 ) {
   void (async () => {
     let hasSentAnyMessage = initialHasSentAnyMessage;
+
+    if (initialDelayMs > 0 && !initialHasSentAnyMessage) {
+      if (!sock || connectionStatus !== "connected") {
+        pauseAutoSendQueue("Koneksi WhatsApp terputus sebelum kirim otomatis dimulai.");
+        return;
+      }
+
+      const waitEndAt = Date.now() + initialDelayMs;
+      autoSendState.phase = "waiting_delay";
+      autoSendState.isInitialDelay = true;
+      autoSendState.nextSendAt = waitEndAt;
+      autoSendState.delaySeconds = Math.max(1, Math.round(initialDelayMs / 1000));
+      autoSendState.currentCustomerId = queueItems[0]?.id || null;
+      autoSendState.currentCustomerName = queueItems[0]?.name || "Pelanggan";
+
+      // Run read-only chat history scan during initial wait so Shareloc/Foto Rumah badges update live
+      void (async () => {
+        for (let preIdx = 0; preIdx < queueItems.length; preIdx++) {
+          if (token !== activeJobToken || !autoSendState.running) break;
+          if (Date.now() >= waitEndAt - 1500) break;
+          const preItem = queueItems[preIdx];
+          if (!preItem || preItem.manualSkipAutoSend) continue;
+          const rawPh = preItem.cleanPhone || preItem.phone || "";
+          const normPh = normalizeWaPhone(rawPh);
+          if (!isValidServerWaPhone(normPh)) continue;
+          try {
+            await checkCustomerChatRequirements(normPh, { deepCheck: true });
+          } catch {
+            // Ignore transient precheck errors during initial wait
+          }
+          await new Promise((r) => setTimeout(r, 120));
+        }
+      })();
+
+      const shouldProceed = await waitInterruptible(initialDelayMs, token);
+      autoSendState.isInitialDelay = false;
+      if (!shouldProceed) {
+        return;
+      }
+      autoSendState.nextSendAt = null;
+      autoSendState.delaySeconds = null;
+    }
 
     for (let i = 0; i < queueItems.length; i++) {
       const item = queueItems[i];
@@ -1615,10 +2302,27 @@ function runAutoSendWorker(
         continue;
       }
 
-      // Check known prior chat & shareloc status
+      if (hasAutoSentToPhoneToday(normPhone)) {
+        autoSendState.items[item.id] = {
+          customerId: item.id,
+          name: item.name || "Pelanggan",
+          phone: item.phone || "",
+          status: "skipped_daily_limit",
+          hasPriorChat: true,
+          hasSentShareloc: knownSharelocPhones.has(normPhone),
+          hasHousePhoto: knownHousePhotoPhones.has(normPhone),
+          reason: "Maksimal 1x kirim otomatis per hari ke nomor tujuan yang sama",
+        };
+        autoSendState.skippedCount++;
+        autoSendState.processed++;
+        continue;
+      }
+
+      // Check known prior chat, shareloc & house photo status
       let hasPriorChat =
         knownChattedPhones.has(normPhone) || Boolean(item.waTemplateSent);
       let hasSentShareloc = knownSharelocPhones.has(normPhone);
+      let hasHousePhoto = knownHousePhotoPhones.has(normPhone);
 
       // Verify registration + check LID mapping before deciding delay/send
       let targetJid = `${normPhone}@s.whatsapp.net`;
@@ -1640,6 +2344,10 @@ function runAutoSendWorker(
             if (pendingSharelocLids.has(resolvedLid)) {
               hasPriorChat = true;
               hasSentShareloc = true;
+            }
+            if (pendingHousePhotoLids.has(resolvedLid)) {
+              hasPriorChat = true;
+              hasHousePhoto = true;
             }
             recordLidMapping(resolvedLid, normPhone);
           }
@@ -1674,10 +2382,11 @@ function runAutoSendWorker(
         continue;
       }
 
-      if (hasPriorChat && !hasSentShareloc) {
+      if (!hasSentShareloc && !hasHousePhoto) {
         await ensureDeepCustomerHistoryChecked(normPhone, false);
         hasSentShareloc = knownSharelocPhones.has(normPhone);
-        if (hasSentShareloc) {
+        hasHousePhoto = knownHousePhotoPhones.has(normPhone);
+        if (hasSentShareloc || hasHousePhoto) {
           hasPriorChat = true;
         }
       }
@@ -1695,12 +2404,15 @@ function runAutoSendWorker(
         break;
       }
 
+      const activeTemplates = pausedJobContext?.templates || templates;
+      const activeLocs = pausedJobContext?.tempatCodList || tempatCodList;
       const plan = buildAutoMessagesForItem(
         item,
         hasPriorChat,
         hasSentShareloc,
-        templates,
-        tempatCodList,
+        hasHousePhoto,
+        activeTemplates,
+        activeLocs,
         itemIndex
       );
 
@@ -1712,7 +2424,13 @@ function runAutoSendWorker(
           status: "skipped_chatted",
           hasPriorChat,
           hasSentShareloc,
-          reason: "Sudah pernah chat & sudah kirim shareloc (Non-COD) — dilewati otomatis",
+          hasHousePhoto,
+          reason:
+            hasSentShareloc && hasHousePhoto
+              ? "Shareloc & Foto Rumah sudah ada (Non-COD) — tanpa kirim pesan"
+              : hasSentShareloc
+              ? "Sudah ada Shareloc di chat (Non-COD) — tanpa kirim pesan"
+              : "Sudah ada Foto Rumah di chat (Non-COD) — tanpa kirim pesan",
         };
         autoSendState.skippedCount++;
         autoSendState.processed++;
@@ -1739,6 +2457,7 @@ function runAutoSendWorker(
             status: "waiting_delay",
             hasPriorChat,
             hasSentShareloc,
+            hasHousePhoto,
             reason: `Menunggu jeda aman ${autoSendState.delaySeconds} detik`,
           };
 
@@ -1763,6 +2482,23 @@ function runAutoSendWorker(
         break;
       }
 
+      // Re-check daily limit right before socket write in case of pause/resume edge timing
+      if (hasAutoSentToPhoneToday(normPhone)) {
+        autoSendState.items[item.id] = {
+          customerId: item.id,
+          name: item.name || "Pelanggan",
+          phone: item.phone || "",
+          status: "skipped_daily_limit",
+          hasPriorChat: true,
+          hasSentShareloc,
+          hasHousePhoto,
+          reason: "Maksimal 1x kirim otomatis per hari ke nomor tujuan yang sama",
+        };
+        autoSendState.skippedCount++;
+        autoSendState.processed++;
+        continue;
+      }
+
       autoSendState.phase = "sending";
       autoSendState.nextSendAt = null;
       autoSendState.delaySeconds = null;
@@ -1773,6 +2509,7 @@ function runAutoSendWorker(
         status: "sending",
         hasPriorChat,
         hasSentShareloc,
+        hasHousePhoto,
         reason: "Mengirim pesan...",
       };
 
@@ -1780,6 +2517,7 @@ function runAutoSendWorker(
         await sock.sendMessage(targetJid, { text: plan.text });
         hasSentAnyMessage = true;
         lastActualSentAt = Date.now();
+        markPhoneAutoSentToday(normPhone);
 
         if (!knownChattedPhones.has(normPhone)) {
           knownChattedPhones.add(normPhone);
@@ -1797,13 +2535,18 @@ function runAutoSendWorker(
           templateType: plan.templateType,
           hasPriorChat,
           hasSentShareloc,
+          hasHousePhoto,
           sentAt: Date.now(),
           reason:
             plan.action === "send_cod_only"
-              ? "Sudah chat & shareloc — terkirim template COD saja"
-              : hasPriorChat && !hasSentShareloc
-              ? "Sudah pernah chat tapi belum shareloc — terkirim pesan lengkap"
-              : "Belum pernah chat — terkirim pesan lengkap",
+              ? hasSentShareloc && hasHousePhoto
+                ? "Shareloc & Foto Rumah sudah ada — terkirim info COD saja"
+                : hasSentShareloc
+                ? "Sudah ada Shareloc di chat — terkirim info COD saja"
+                : "Sudah ada Foto Rumah di chat — terkirim info COD saja"
+              : hasPriorChat
+              ? "Belum ada Shareloc/Foto di chat — terkirim template lengkap"
+              : "Belum pernah chat — terkirim template lengkap",
         };
 
         if (plan.action === "send_cod_only") {
@@ -1819,6 +2562,7 @@ function runAutoSendWorker(
           status: "failed",
           hasPriorChat,
           hasSentShareloc,
+          hasHousePhoto,
           reason: err?.message || "Gagal mengirim pesan WhatsApp",
         };
         autoSendState.failedCount++;
@@ -1839,8 +2583,10 @@ function runAutoSendWorker(
     }
 
     if (token === activeJobToken && autoSendState.running) {
+      activeQueueItemsRef = null;
       autoSendState.running = false;
       autoSendState.phase = "completed";
+      autoSendState.isInitialDelay = false;
       autoSendState.currentCustomerId = null;
       autoSendState.currentCustomerName = null;
       autoSendState.nextSendAt = null;
@@ -1852,7 +2598,9 @@ function runAutoSendWorker(
       const allProcessed =
         autoSendState.total > 0 && autoSendState.processed >= autoSendState.total;
       if (allProcessed) {
+        activeQueueItemsRef = null;
         autoSendState.phase = "completed";
+        autoSendState.isInitialDelay = false;
         autoSendState.currentCustomerId = null;
         autoSendState.currentCustomerName = null;
         autoSendState.finishedAt = Date.now();
@@ -1865,7 +2613,8 @@ function runAutoSendWorker(
 export function startAutoSendQueue(
   items: AutoSendInputItem[],
   templates: AutoSendTemplates,
-  tempatCodList: TempatCodItem[]
+  tempatCodList: TempatCodItem[],
+  options?: { initialDelayMs?: number }
 ): AutoSendStateSnapshot {
   if (connectionStatus !== "connected" || !sock) {
     throw new Error("WhatsApp belum terhubung. Hubungkan WhatsApp terlebih dahulu.");
@@ -1877,11 +2626,17 @@ export function startAutoSendQueue(
     throw new Error("Tidak ada daftar paket di modul Sending.");
   }
 
+  // Yield any ongoing background precheck cleanly so user can start auto-send immediately
+  stopPrecheckCustomers();
+
+  const initialDelayMs = Math.max(0, Math.min(300_000, Number(options?.initialDelayMs) || 0));
+  const queueCopy = [...items];
   const token = ++activeJobToken;
-  pausedJobContext = { items, templates, tempatCodList };
+  activeQueueItemsRef = queueCopy;
+  pausedJobContext = { items: [...queueCopy], templates, tempatCodList };
 
   const initialMap: Record<string, AutoSendItemResult> = {};
-  for (const item of items) {
+  for (const item of queueCopy) {
     initialMap[item.id] = {
       customerId: item.id,
       name: item.name || "Pelanggan",
@@ -1892,26 +2647,84 @@ export function startAutoSendQueue(
 
   autoSendState = {
     running: true,
-    phase: "checking",
-    total: items.length,
+    phase: initialDelayMs > 0 ? "waiting_delay" : "checking",
+    isInitialDelay: initialDelayMs > 0,
+    total: queueCopy.length,
     processed: 0,
     sentFullCount: 0,
     sentCodOnlyCount: 0,
     skippedCount: 0,
     failedCount: 0,
-    currentCustomerId: null,
-    currentCustomerName: null,
-    nextSendAt: null,
-    delaySeconds: null,
+    currentCustomerId: queueCopy[0]?.id || null,
+    currentCustomerName: queueCopy[0]?.name || null,
+    nextSendAt: initialDelayMs > 0 ? Date.now() + initialDelayMs : null,
+    delaySeconds: initialDelayMs > 0 ? Math.max(1, Math.round(initialDelayMs / 1000)) : null,
     startedAt: Date.now(),
     finishedAt: null,
     lastError: null,
     items: initialMap,
   };
 
-  runAutoSendWorker(items, templates, tempatCodList, token, 0, false);
+  runAutoSendWorker(queueCopy, templates, tempatCodList, token, 0, false, initialDelayMs);
 
   return getAutoSendState();
+}
+
+export function enqueueAutoSendBatch(
+  items: AutoSendInputItem[],
+  templates: AutoSendTemplates,
+  tempatCodList: TempatCodItem[],
+  options?: { initialDelayMs?: number }
+): AutoSendStateSnapshot {
+  if (connectionStatus !== "connected" || !sock) {
+    throw new Error("WhatsApp belum terhubung. Hubungkan WhatsApp terlebih dahulu.");
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return getAutoSendState();
+  }
+
+  if (autoSendState.running && activeQueueItemsRef) {
+    const newItems = items.filter((it) => !autoSendState.items[it.id]);
+    if (newItems.length > 0) {
+      for (const item of newItems) {
+        autoSendState.items[item.id] = {
+          customerId: item.id,
+          name: item.name || "Pelanggan",
+          phone: item.phone || "",
+          status: "pending",
+        };
+      }
+      autoSendState.total += newItems.length;
+      activeQueueItemsRef.push(...newItems);
+      if (pausedJobContext) {
+        pausedJobContext.items = [...pausedJobContext.items, ...newItems];
+        pausedJobContext.templates = templates;
+        pausedJobContext.tempatCodList = tempatCodList;
+      }
+    }
+    return getAutoSendState();
+  }
+
+  if (autoSendState.phase === "paused" && pausedJobContext) {
+    const newItems = items.filter((it) => !autoSendState.items[it.id]);
+    if (newItems.length > 0) {
+      for (const item of newItems) {
+        autoSendState.items[item.id] = {
+          customerId: item.id,
+          name: item.name || "Pelanggan",
+          phone: item.phone || "",
+          status: "pending",
+        };
+      }
+      autoSendState.total += newItems.length;
+      pausedJobContext.items = [...pausedJobContext.items, ...newItems];
+      pausedJobContext.templates = templates;
+      pausedJobContext.tempatCodList = tempatCodList;
+    }
+    return getAutoSendState();
+  }
+
+  return startAutoSendQueue(items, templates, tempatCodList, options);
 }
 
 export function resumeAutoSendQueue(
@@ -1928,6 +2741,8 @@ export function resumeAutoSendQueue(
   if (autoSendState.phase !== "paused" || !pausedJobContext) {
     throw new Error("Tidak ada antrean pengiriman yang dijeda.");
   }
+
+  stopPrecheckCustomers();
 
   const templates = latestTemplates || pausedJobContext.templates;
   const tempatCodList = latestTempatCodList || pausedJobContext.tempatCodList;
@@ -1977,7 +2792,11 @@ export function resumeAutoSendQueue(
     } else if (res.status === "sent_cod_only") {
       sentCodOnlyCount++;
       processedCount++;
-    } else if (res.status === "skipped_chatted" || res.status === "skipped_manual") {
+    } else if (
+      res.status === "skipped_chatted" ||
+      res.status === "skipped_manual" ||
+      res.status === "skipped_daily_limit"
+    ) {
       skippedCount++;
       processedCount++;
     } else if (
@@ -2021,10 +2840,12 @@ export function resumeAutoSendQueue(
   }
 
   const token = ++activeJobToken;
+  activeQueueItemsRef = remainingQueue;
   autoSendState = {
     ...autoSendState,
     running: true,
     phase: "checking",
+    isInitialDelay: false,
     total: totalCount,
     processed: processedCount,
     sentFullCount,
@@ -2047,7 +2868,8 @@ export function resumeAutoSendQueue(
     tempatCodList,
     token,
     processedCount,
-    hadPriorSent
+    hadPriorSent,
+    0
   );
 
   return getAutoSendState();

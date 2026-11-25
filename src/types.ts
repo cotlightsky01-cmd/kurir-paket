@@ -23,6 +23,7 @@ export interface Customer {
   waLastTemplateType?: 'titip' | 'cod' | 'nocod'; // track whether user previously chose titip template
   titipLocationName?: string; // drop-off location name if titip template was chosen
   manualSkipAutoSend?: boolean; // when true, automatic WA sending skips this card
+  autoSendProcessed?: boolean; // true once auto-send completed/skipped this card; re-enables only for new data
   fillingBatchId?: string; // identifies the Filling session batch for preserving original order on partial sends
   fillingOrder?: number; // original order index inside the Filling batch
 }
@@ -64,6 +65,8 @@ export interface WaGatewayState {
   knownChatsCount: number;
   knownSharelocCount?: number;
   knownHousePhotoCount?: number;
+  lockedAnchorsCount?: number;
+  maxAnchorsLimit?: number;
   hasSession: boolean;
   lastError: string | null;
 }
@@ -87,6 +90,7 @@ export type WaAutoSendItemStatus =
   | 'sent_cod_only'
   | 'skipped_chatted'
   | 'skipped_manual'
+  | 'skipped_daily_limit'
   | 'invalid_phone'
   | 'unregistered'
   | 'failed'
@@ -99,12 +103,30 @@ export interface WaAutoSendItemResult {
   status: WaAutoSendItemStatus;
   reason?: string;
   templateType?: 'titip' | 'cod' | 'nocod' | 'cod_only';
+  hasPriorChat?: boolean;
+  hasSentShareloc?: boolean;
+  hasHousePhoto?: boolean;
   sentAt?: number;
 }
+
+export interface WaPrecheckState {
+  running: boolean;
+  total: number;
+  completed: number;
+  currentCustomerId: string | null;
+  currentCustomerName: string | null;
+  currentCustomerPhone: string | null;
+  checkedPhones?: string[];
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export type FillingMode = 'manual' | 'otomatis';
 
 export interface WaAutoSendState {
   running: boolean;
   phase: 'idle' | 'checking' | 'waiting_delay' | 'sending' | 'paused' | 'completed' | 'stopped';
+  isInitialDelay?: boolean;
   total: number;
   processed: number;
   sentFullCount: number;

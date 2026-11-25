@@ -55,6 +55,9 @@ interface CustomerCardProps {
   autoSendItem?: WaAutoSendItemResult;
   chatHistory?: CustomerChatHistoryInfo;
   isCheckingWa?: boolean;
+  isPrecheckingWa?: boolean;
+  hasBeenPrechecked?: boolean;
+  isDailySentToday?: boolean;
 }
 
 export const CustomerCard: React.FC<CustomerCardProps> = ({
@@ -84,12 +87,15 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
   autoSendItem,
   chatHistory,
   isCheckingWa,
+  isPrecheckingWa,
+  hasBeenPrechecked,
+  isDailySentToday,
 }) => {
   const isModul2Today = cust.status === 'modul2' && isToday(cust.completedAt || cust.timestamp);
   const cardSeqNumber = displayIndex !== undefined ? displayIndex : cust.originalIndex;
   const hasShareloc = Boolean(chatHistory?.hasShareloc);
   const hasHousePhoto = Boolean(chatHistory?.hasHousePhoto);
-  const hasAllLocationProof = hasShareloc && hasHousePhoto;
+  const hasAllLocationProof = hasShareloc || hasHousePhoto;
   const isNoCodCard = parseCodAmount(cust.cod) === 0;
 
   const SWIPE_TRIGGER_PX = 135;
@@ -189,6 +195,8 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                         ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                         : autoSendItem.status === 'sent_cod_only'
                         ? 'bg-[#C5A059]/20 text-[#E9D5A6] border-[#C5A059]/40'
+                        : autoSendItem.status === 'skipped_daily_limit'
+                        ? 'bg-orange-500/15 text-orange-300 border-orange-500/35'
                         : autoSendItem.status === 'skipped_chatted' ||
                           autoSendItem.status === 'skipped_manual'
                         ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
@@ -208,6 +216,8 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                       ? 'Auto: Lengkap'
                       : autoSendItem.status === 'sent_cod_only'
                       ? 'Auto: COD Saja'
+                      : autoSendItem.status === 'skipped_daily_limit'
+                      ? 'Limit 1x/Hari'
                       : autoSendItem.status === 'skipped_manual'
                       ? 'Skip Manual'
                       : autoSendItem.status === 'skipped_chatted'
@@ -223,6 +233,14 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                       : autoSendItem.status === 'cancelled'
                       ? 'Dihentikan'
                       : 'Gagal / Invalid'}
+                  </span>
+                )}
+                {isDailySentToday && autoSendItem?.status !== 'skipped_daily_limit' && (
+                  <span
+                    className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-300 border border-orange-500/25"
+                    title="Nomor tujuan ini sudah menerima pengiriman otomatis hari ini (maks. 1x/hari)"
+                  >
+                    1x/Hari Terpakai
                   </span>
                 )}
                 {cust.manualSkipAutoSend && autoSendItem?.status !== 'skipped_manual' && (
@@ -273,20 +291,18 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                     onClick={() => handleWhatsAppChat(cust)}
                     disabled={Boolean(isCheckingWa)}
                     className={`p-1.5 rounded flex items-center gap-1 transition-all cursor-pointer text-[10px] font-bold disabled:opacity-60 ${
-                      hasAllLocationProof
-                        ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 border border-emerald-500/35'
-                        : cust.waTemplateSent 
-                        ? 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white border border-neutral-700/50' 
+                      cust.waTemplateSent
+                        ? 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white border border-neutral-700/50'
                         : 'bg-[#25D366]/10 text-[#25D366] hover:bg-[#25D366]/20 border border-[#25D366]/20'
                     }`}
                     title={
-                      hasAllLocationProof
+                      cust.waTemplateSent
+                        ? 'Sudah terkirim — buka jalur percakapan tanpa mengirim template apa pun'
+                        : hasAllLocationProof
                         ? isNoCodCard
-                          ? "Shareloc & Foto Rumah sudah ada — buka chat tanpa template"
-                          : "Shareloc & Foto Rumah sudah ada — kirim acuan template COD saja"
-                        : cust.waTemplateSent
-                        ? "Belum lengkap (Shareloc / Foto Rumah) — kirim variasi template"
-                        : "Cek Shareloc & Foto Rumah lalu kirim WhatsApp"
+                          ? 'Belum diinteraksi (Shareloc/Foto sudah ada — tanpa kirim pesan)'
+                          : 'Belum diinteraksi (Shareloc/Foto sudah ada — kirim info COD saja)'
+                        : 'Belum diinteraksi — cek Shareloc & Foto lalu kirim template WhatsApp'
                     }
                   >
                     {isCheckingWa ? (
@@ -294,11 +310,7 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                     ) : (
                       <MessageSquare className="w-3.5 h-3.5" />
                     )}
-                    {hasAllLocationProof ? (
-                      <span className="text-[9px] font-bold text-emerald-300 flex items-center gap-0.5">
-                        <Check className="w-2.5 h-2.5 text-emerald-400" /> {isNoCodCard ? 'Chat' : 'COD'}
-                      </span>
-                    ) : cust.waTemplateSent ? (
+                    {cust.waTemplateSent ? (
                       <span className="text-[9px] font-medium text-neutral-400 flex items-center gap-0.5">
                         <Check className="w-2.5 h-2.5 text-green-500" /> Terkirim
                       </span>
@@ -318,9 +330,14 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
             </div>
           </div>
 
-          {/* Shareloc & House Photo Chat History Indicators */}
-          {(hasShareloc || hasHousePhoto) && (
+          {/* Shareloc & House Photo Chat History Indicators + Read Progress */}
+          {(isPrecheckingWa || hasShareloc || hasHousePhoto || (cust.status === 'modul1' && hasBeenPrechecked)) && (
             <div className="flex justify-end items-center gap-1 flex-wrap">
+              {isPrecheckingWa && (
+                <span className="text-[9px] font-bold text-amber-300 bg-amber-500/15 border border-amber-500/30 px-1.5 py-0.5 rounded flex items-center gap-1 animate-pulse">
+                  <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-400" /> Membaca pesan...
+                </span>
+              )}
               {hasShareloc && (
                 <span className="text-[9px] font-bold text-emerald-300 bg-emerald-500/10 border border-emerald-500/25 px-1.5 py-0.5 rounded flex items-center gap-1">
                   <MapPin className="w-2.5 h-2.5 text-emerald-400" /> Shareloc
@@ -330,6 +347,37 @@ export const CustomerCard: React.FC<CustomerCardProps> = ({
                 <span className="text-[9px] font-bold text-sky-300 bg-sky-500/10 border border-sky-500/25 px-1.5 py-0.5 rounded flex items-center gap-1">
                   <ImageIcon className="w-2.5 h-2.5 text-sky-400" /> Foto Rumah
                 </span>
+              )}
+              {cust.status === 'modul1' && !isPrecheckingWa && hasBeenPrechecked && (
+                hasAllLocationProof ? (
+                  isNoCodCard ? (
+                    <span
+                      className="text-[9px] font-bold text-emerald-300 bg-emerald-500/10 border border-emerald-500/25 px-1.5 py-0.5 rounded flex items-center gap-1"
+                      title="Sudah ada Shareloc atau Foto Rumah (Non-COD) — tanpa mengirim pesan, otomatis Terkirim"
+                    >
+                      <Check className="w-2.5 h-2.5 text-emerald-400" />{' '}
+                      {hasShareloc && hasHousePhoto
+                        ? 'Lengkap • Tanpa Pesan'
+                        : hasShareloc
+                        ? 'Ada Shareloc • Tanpa Pesan'
+                        : 'Ada Foto • Tanpa Pesan'}
+                    </span>
+                  ) : (
+                    <span
+                      className="text-[9px] font-bold text-[#E9D5A6] bg-[#C5A059]/15 border border-[#C5A059]/30 px-1.5 py-0.5 rounded flex items-center gap-1"
+                      title="Sudah ada Shareloc atau Foto Rumah (COD) — cukup informasikan nominal COD tanpa minta shareloc"
+                    >
+                      <Check className="w-2.5 h-2.5 text-[#D4AF37]" /> Info COD Saja
+                    </span>
+                  )
+                ) : (
+                  <span
+                    className="text-[9px] font-medium text-neutral-400 bg-neutral-800/80 border border-neutral-700/60 px-1.5 py-0.5 rounded flex items-center gap-1"
+                    title="Belum ada Shareloc maupun Foto Rumah — kirim pesan meminta shareloc"
+                  >
+                    <MessageSquare className="w-2.5 h-2.5 text-neutral-400" /> Minta Shareloc
+                  </span>
+                )
               )}
             </div>
           )}

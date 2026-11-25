@@ -25,7 +25,7 @@ import {
   SkipForward
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Customer, TempatCodLocation, BulkItem, WaGatewayState, WaAutoSendState, HoldGroupResolvedItem, CustomerChatHistoryInfo } from './types';
+import { Customer, TempatCodLocation, BulkItem, WaGatewayState, WaAutoSendState, WaPrecheckState, HoldGroupResolvedItem, CustomerChatHistoryInfo } from './types';
 import { BulkProcessorView } from './components/BulkProcessorView';
 import { CustomerCard } from './components/CustomerCard';
 import { SuccessView } from './components/views/SuccessView';
@@ -149,12 +149,15 @@ export default function App() {
     pairingCode: null,
     user: null,
     knownChatsCount: 0,
+    lockedAnchorsCount: 0,
+    maxAnchorsLimit: 6000,
     hasSession: false,
     lastError: null,
   });
   const [waAutoSend, setWaAutoSend] = useState<WaAutoSendState>({
     running: false,
     phase: 'idle',
+    isInitialDelay: false,
     total: 0,
     processed: 0,
     sentFullCount: 0,
@@ -172,6 +175,21 @@ export default function App() {
   });
   const [showAutoSendBanner, setShowAutoSendBanner] = useState(false);
   const [autoSendCountdownSec, setAutoSendCountdownSec] = useState(0);
+  const waitingWaFillingAutoIdsRef = useRef<Set<string>>(new Set());
+  const [waitingWaFillingAutoCount, setWaitingWaFillingAutoCount] = useState(0);
+  const [waPrecheck, setWaPrecheck] = useState<WaPrecheckState>({
+    running: false,
+    total: 0,
+    completed: 0,
+    currentCustomerId: null,
+    currentCustomerName: null,
+    currentCustomerPhone: null,
+    checkedPhones: [],
+    startedAt: null,
+    finishedAt: null,
+  });
+  const [dailySentPhones, setDailySentPhones] = useState<Set<string>>(() => new Set());
+  const precheckedCustomerIdsRef = useRef<Set<string>>(new Set());
   const [customerChatHistoryMap, setCustomerChatHistoryMap] = useState<Record<string, CustomerChatHistoryInfo>>({});
   const [checkingWaCustomerId, setCheckingWaCustomerId] = useState<string | null>(null);
   const [holdGroups, setHoldGroups] = useState<HoldGroupResolvedItem[]>(() =>
@@ -506,6 +524,7 @@ export default function App() {
       status: 'modul1', // Back to Sending / Modul 1
       timestamp: Date.now(),
       completedAt: undefined,
+      autoSendProcessed: false,
     };
 
     unmarkCustomerIdDeleted(cust.id);
@@ -760,9 +779,15 @@ export default function App() {
 
   const toggleManualSkipAutoSend = (id: string) => {
     setCustomers(prev =>
-      prev.map(c =>
-        c.id === id ? { ...c, manualSkipAutoSend: !c.manualSkipAutoSend } : c
-      )
+      prev.map(c => {
+        if (c.id !== id) return c;
+        const nextSkip = !c.manualSkipAutoSend;
+        return {
+          ...c,
+          manualSkipAutoSend: nextSkip,
+          waTemplateSent: nextSkip ? true : c.waTemplateSent,
+        };
+      })
     );
   };
 
@@ -825,6 +850,33 @@ export default function App() {
       return;
     }
 
+    const openWhatsAppConversation = (messageText: string) => {
+      const encodedText = messageText ? encodeURIComponent(messageText) : '';
+      const useBusiness = isBusinessOverride !== undefined ? isBusinessOverride : waTargetApp === 'business';
+
+      if (useBusiness) {
+        const businessUrl = `whatsapp-business://send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
+        const webUrl = `https://api.whatsapp.com/send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
+        try {
+          window.location.href = businessUrl;
+          setTimeout(() => {
+            window.open(webUrl, '_blank');
+          }, 600);
+        } catch {
+          window.open(webUrl, '_blank');
+        }
+      } else {
+        const waUrl = `https://api.whatsapp.com/send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
+        window.open(waUrl, '_blank');
+      }
+    };
+
+    // Once card is already marked Terkirim (interacted or skipped), never send any template again
+    if (!dropOffLocation && customer.waTemplateSent) {
+      openWhatsAppConversation('');
+      return;
+    }
+
     const cachedHistory = customerChatHistoryMap[phone];
     let hasShareloc = Boolean(cachedHistory?.hasShareloc);
     let hasHousePhoto = Boolean(cachedHistory?.hasHousePhoto);
@@ -852,7 +904,7 @@ export default function App() {
             hasPriorChat: Boolean(data?.hasPriorChat),
             hasShareloc,
             hasHousePhoto,
-            hasAllLocationProof: hasShareloc && hasHousePhoto,
+            hasAllLocationProof: hasShareloc || hasHousePhoto,
             deepChecked: Boolean(data?.deepChecked),
             checkedAt: Date.now(),
           },
@@ -867,7 +919,7 @@ export default function App() {
       setCheckingWaCustomerId((prev) => (prev === customer.id ? null : prev));
     }
 
-    const hasAllProof = hasShareloc && hasHousePhoto;
+    const hasAllProof = hasShareloc || hasHousePhoto;
     let textToSend = '';
     const roundedCod = getRoundedCodFormatted(customer.cod);
     const isNoCod = parseCodAmount(customer.cod) === 0;
@@ -970,24 +1022,7 @@ export default function App() {
       } : c));
     }
 
-    const encodedText = textToSend ? encodeURIComponent(textToSend) : '';
-    const useBusiness = isBusinessOverride !== undefined ? isBusinessOverride : waTargetApp === 'business';
-
-    if (useBusiness) {
-      const businessUrl = `whatsapp-business://send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
-      const webUrl = `https://api.whatsapp.com/send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
-      try {
-        window.location.href = businessUrl;
-        setTimeout(() => {
-          window.open(webUrl, '_blank');
-        }, 600);
-      } catch {
-        window.open(webUrl, '_blank');
-      }
-    } else {
-      const waUrl = `https://api.whatsapp.com/send?phone=${phone}${encodedText ? `&text=${encodedText}` : ''}`;
-      window.open(waUrl, '_blank');
-    }
+    openWhatsAppConversation(textToSend);
   };
 
   // Helper to fetch current location Google Maps URL
@@ -1578,12 +1613,14 @@ export default function App() {
   const clearAllData = () => {
     deletedCustomerIdsRef.current.clear();
     deletedBulkIdsRef.current.clear();
+    precheckedCustomerIdsRef.current.clear();
     localStorage.removeItem('kurir_parser_deleted_cust_ids');
     localStorage.removeItem('kurir_parser_deleted_bulk_ids');
     setCustomers([]);
     setBulkItems([]);
     localStorage.removeItem('kurir_parser_customers');
     localStorage.removeItem('kurir_parser_bulk_items');
+    void handleResetAutoSendSending();
   };
 
   // Filtered customer lists
@@ -1600,6 +1637,8 @@ export default function App() {
       );
     })
   );
+  const pendingAutoSendCustomers =
+    activeTab === 'modul1' ? filteredCustomers.filter((c) => !c.autoSendProcessed) : [];
 
   const matchingArchived = deduplicateById(
     searchQuery.trim()
@@ -1630,17 +1669,41 @@ export default function App() {
 
   // --- Baileys WhatsApp Auto-Send Helpers (Sending Module Only) ---
   const syncWaAutoSendUpdatesToCustomers = (nextAutoSend: WaAutoSendState) => {
-    const sentItems = Object.values(nextAutoSend.items || {}).filter(
-      (it) => it.status === 'sent_full' || it.status === 'sent_cod_only'
-    );
-    if (sentItems.length === 0) return;
+    const itemsMap = nextAutoSend.items || {};
+    const allResults = Object.values(itemsMap);
+    if (allResults.length === 0) return;
 
-    const sentMap = new Map(sentItems.map((it) => [it.customerId, it]));
-    setCustomers((prev) => {
-      let changed = false;
-      const next = prev.map((c) => {
-        const res = sentMap.get(c.id);
-        if (res && !c.waTemplateSent) {
+    const isTerminalStatus = (status: WaAutoSendState['items'][string]['status']) =>
+      status === 'sent_full' ||
+      status === 'sent_cod_only' ||
+      status === 'skipped_chatted' ||
+      status === 'skipped_manual' ||
+      status === 'skipped_daily_limit' ||
+      status === 'invalid_phone' ||
+      status === 'unregistered' ||
+      status === 'failed';
+
+    const terminalMap = new Map(
+      allResults.filter((it) => isTerminalStatus(it.status)).map((it) => [it.customerId, it])
+    );
+
+    if (terminalMap.size > 0) {
+      setCustomers((prev) => {
+        let changed = false;
+        const next = prev.map((c) => {
+          const res = terminalMap.get(c.id);
+          if (!res) return c;
+
+          const shouldMarkSent =
+            res.status === 'sent_full' ||
+            res.status === 'sent_cod_only' ||
+            res.status === 'skipped_chatted' ||
+            res.status === 'skipped_daily_limit';
+
+          const needsProcessedFlag = !c.autoSendProcessed;
+          const needsSentFlag = shouldMarkSent && !c.waTemplateSent;
+          if (!needsProcessedFlag && !needsSentFlag) return c;
+
           changed = true;
           const mappedType: 'titip' | 'cod' | 'nocod' =
             res.templateType === 'titip'
@@ -1648,16 +1711,36 @@ export default function App() {
               : res.templateType === 'nocod'
               ? 'nocod'
               : 'cod';
+
           return {
             ...c,
-            waTemplateSent: true,
-            waLastTemplateType: mappedType,
+            autoSendProcessed: true,
+            waTemplateSent: shouldMarkSent ? true : c.waTemplateSent,
+            waLastTemplateType:
+              res.status === 'sent_full' || res.status === 'sent_cod_only'
+                ? mappedType
+                : c.waLastTemplateType,
           };
-        }
-        return c;
+        });
+        return changed ? next : prev;
       });
-      return changed ? next : prev;
-    });
+    }
+  };
+
+  const applyGatewayPayload = (data: any) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.gateway) setWaGateway(data.gateway);
+    if (data.precheck) setWaPrecheck(data.precheck);
+    if (Array.isArray(data.dailySentPhones)) {
+      setDailySentPhones(new Set(data.dailySentPhones));
+    }
+    if (data.autoSend) {
+      setWaAutoSend(data.autoSend);
+      syncWaAutoSendUpdatesToCustomers(data.autoSend);
+      if (data.autoSend.running) {
+        setShowAutoSendBanner(true);
+      }
+    }
   };
 
   const refreshHoldGroups = async () => {
@@ -1678,14 +1761,7 @@ export default function App() {
       const res = await fetch('/api/wa/status');
       if (!res.ok) return;
       const data = await res.json();
-      if (data.gateway) setWaGateway(data.gateway);
-      if (data.autoSend) {
-        setWaAutoSend(data.autoSend);
-        syncWaAutoSendUpdatesToCustomers(data.autoSend);
-        if (data.autoSend.running) {
-          setShowAutoSendBanner(true);
-        }
-      }
+      applyGatewayPayload(data);
     } catch {
       // Ignore transient network errors
     }
@@ -1695,8 +1771,7 @@ export default function App() {
     const res = await fetch('/api/wa/connect', { method: 'POST' });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error || 'Gagal menghubungkan WhatsApp');
-    if (data.gateway) setWaGateway(data.gateway);
-    if (data.autoSend) setWaAutoSend(data.autoSend);
+    applyGatewayPayload(data);
   };
 
   const requestWaPairingCodeClient = async (phone: string): Promise<string | null> => {
@@ -1715,8 +1790,8 @@ export default function App() {
     const res = await fetch('/api/wa/logout', { method: 'POST' });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error || 'Gagal memutuskan WhatsApp');
-    if (data.gateway) setWaGateway(data.gateway);
-    if (data.autoSend) setWaAutoSend(data.autoSend);
+    precheckedCustomerIdsRef.current.clear();
+    applyGatewayPayload(data);
   };
 
   const handleStartAutoSendSending = async () => {
@@ -1730,18 +1805,17 @@ export default function App() {
       return;
     }
 
-    if (filteredCustomers.length === 0) {
-      alert('Tidak ada data paket di modul Sending.');
+    if (filteredCustomers.length === 0 || pendingAutoSendCustomers.length === 0) {
       return;
     }
 
-    if (filteredCustomers.every((c) => c.manualSkipAutoSend)) {
-      alert('Semua kartu di modul Sending ditandai Skip Manual. Matikan minimal 1 Skip Manual untuk memulai kirim otomatis.');
+    if (pendingAutoSendCustomers.every((c) => c.manualSkipAutoSend)) {
+      alert('Semua kartu baru di modul Sending ditandai Skip Manual. Matikan minimal 1 Skip Manual untuk memulai kirim otomatis.');
       return;
     }
 
     try {
-      const payloadItems = filteredCustomers.map((c) => ({
+      const payloadItems = pendingAutoSendCustomers.map((c) => ({
         id: c.id,
         name: c.name,
         phone: c.phone,
@@ -1772,11 +1846,8 @@ export default function App() {
         alert(data?.error || 'Gagal memulai kirim otomatis.');
         return;
       }
-      if (data.gateway) setWaGateway(data.gateway);
-      if (data.autoSend) {
-        setWaAutoSend(data.autoSend);
-        setShowAutoSendBanner(true);
-      }
+      applyGatewayPayload(data);
+      setShowAutoSendBanner(true);
     } catch (err: any) {
       alert(err?.message || 'Gagal menghubungi server WhatsApp.');
     }
@@ -1786,10 +1857,8 @@ export default function App() {
     try {
       const res = await fetch('/api/wa/auto-send/pause', { method: 'POST' });
       const data = await res.json();
-      if (data.gateway) setWaGateway(data.gateway);
+      applyGatewayPayload(data);
       if (data.autoSend) {
-        setWaAutoSend(data.autoSend);
-        syncWaAutoSendUpdatesToCustomers(data.autoSend);
         setShowAutoSendBanner(true);
       }
     } catch {
@@ -1809,7 +1878,10 @@ export default function App() {
     }
 
     try {
-      const payloadItems = filteredCustomers.map((c) => ({
+      const resumeCandidates = filteredCustomers.filter(
+        (c) => !c.autoSendProcessed || Boolean(waAutoSend.items[c.id])
+      );
+      const payloadItems = resumeCandidates.map((c) => ({
         id: c.id,
         name: c.name,
         phone: c.phone,
@@ -1840,12 +1912,8 @@ export default function App() {
         alert(data?.error || 'Gagal melanjutkan kirim otomatis.');
         return;
       }
-      if (data.gateway) setWaGateway(data.gateway);
-      if (data.autoSend) {
-        setWaAutoSend(data.autoSend);
-        syncWaAutoSendUpdatesToCustomers(data.autoSend);
-        setShowAutoSendBanner(true);
-      }
+      applyGatewayPayload(data);
+      setShowAutoSendBanner(true);
     } catch (err: any) {
       alert(err?.message || 'Gagal menghubungi server WhatsApp.');
     }
@@ -1855,14 +1923,73 @@ export default function App() {
     try {
       const res = await fetch('/api/wa/auto-send/reset', { method: 'POST' });
       const data = await res.json();
-      if (data.gateway) setWaGateway(data.gateway);
-      if (data.autoSend) {
-        setWaAutoSend(data.autoSend);
-        setShowAutoSendBanner(false);
-      }
+      applyGatewayPayload(data);
+      setShowAutoSendBanner(false);
     } catch {
       // Ignore reset error
     }
+  };
+
+  const enqueueFillingCustomersToAutoSend = async (targetCustomers: Customer[], initialDelayMs = 60_000) => {
+    if (targetCustomers.length === 0) return;
+
+    const payloadItems = targetCustomers.map((c) => ({
+      id: c.id,
+      name: c.name,
+      phone: c.phone,
+      cleanPhone: c.cleanPhone,
+      address: c.address,
+      cod: c.cod,
+      waTemplateSent: Boolean(c.waTemplateSent),
+      titipLocationName: c.titipLocationName,
+      manualSkipAutoSend: Boolean(c.manualSkipAutoSend),
+    }));
+
+    try {
+      const res = await fetch('/api/wa/auto-send/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: payloadItems,
+          initialDelayMs,
+          templates: {
+            cod: msgTemplateCod,
+            nocod: msgTemplateNoCod,
+            titip: msgTemplateTitip,
+            codOnlyNoShareloc: msgTemplateAutoCodOnly,
+          },
+          tempatCodList,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (waGateway.status !== 'connected') {
+          targetCustomers.forEach((c) => waitingWaFillingAutoIdsRef.current.add(c.id));
+          setWaitingWaFillingAutoCount(waitingWaFillingAutoIdsRef.current.size);
+        }
+        return;
+      }
+      targetCustomers.forEach((c) => waitingWaFillingAutoIdsRef.current.delete(c.id));
+      setWaitingWaFillingAutoCount(waitingWaFillingAutoIdsRef.current.size);
+      applyGatewayPayload(data);
+      setShowAutoSendBanner(true);
+    } catch {
+      targetCustomers.forEach((c) => waitingWaFillingAutoIdsRef.current.add(c.id));
+      setWaitingWaFillingAutoCount(waitingWaFillingAutoIdsRef.current.size);
+    }
+  };
+
+  const handleAutoTransferBatchToSending = (
+    transferredCustomers: Customer[],
+    _meta: { isFinalBatch: boolean; remainingCount: number }
+  ) => {
+    if (transferredCustomers.length === 0) return;
+    if (waGateway.status !== 'connected') {
+      transferredCustomers.forEach((c) => waitingWaFillingAutoIdsRef.current.add(c.id));
+      setWaitingWaFillingAutoCount(waitingWaFillingAutoIdsRef.current.size);
+      return;
+    }
+    void enqueueFillingCustomersToAutoSend(transferredCustomers, 60_000);
   };
 
   // Initial status fetch when entering Sending or Hold tab
@@ -1875,12 +2002,72 @@ export default function App() {
     }
   }, [activeTab]);
 
-  // Refresh Hold group names whenever WhatsApp connects
+  // Refresh Hold group names and flush queued Filling Otomatis batches whenever WhatsApp connects
   useEffect(() => {
     if (waGateway.status === 'connected') {
       void refreshHoldGroups();
+      if (waitingWaFillingAutoIdsRef.current.size > 0) {
+        const queuedIds = new Set(waitingWaFillingAutoIdsRef.current);
+        const queuedCustomers = latestPayloadRef.current.customers.filter(
+          (c) => c.status === 'modul1' && !c.autoSendProcessed && queuedIds.has(c.id)
+        );
+        if (queuedCustomers.length > 0) {
+          void enqueueFillingCustomersToAutoSend(queuedCustomers, 60_000);
+        } else {
+          waitingWaFillingAutoIdsRef.current.clear();
+          setWaitingWaFillingAutoCount(0);
+        }
+      }
     }
   }, [waGateway.status]);
+
+  // Auto read-only pre-scan whenever Sending receives new data (e.g. from Filling)
+  useEffect(() => {
+    if (waGateway.status !== 'connected' || waAutoSend.running) return;
+
+    const newCandidates = customers.filter((c) => {
+      if (c.status !== 'modul1') return false;
+      if (c.autoSendProcessed) return false;
+      if (precheckedCustomerIdsRef.current.has(c.id)) return false;
+      const phone = c.cleanPhone || cleanPhoneNumber(c.phone || '');
+      return Boolean(phone && isValidWhatsAppNumber(phone));
+    });
+
+    if (newCandidates.length === 0) return;
+
+    newCandidates.forEach((c) => precheckedCustomerIdsRef.current.add(c.id));
+
+    const items = newCandidates.slice(0, 200).map((c) => ({
+      id: c.id,
+      name: c.name,
+      phone: c.cleanPhone || cleanPhoneNumber(c.phone || ''),
+    }));
+
+    void (async () => {
+      try {
+        const res = await fetch('/api/wa/precheck-customers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.gateway) setWaGateway(data.gateway);
+        if (data?.precheck) setWaPrecheck(data.precheck);
+        if (Array.isArray(data?.dailySentPhones)) {
+          setDailySentPhones(new Set(data.dailySentPhones));
+        }
+        if (data?.results && typeof data.results === 'object') {
+          setCustomerChatHistoryMap((prev) => ({
+            ...prev,
+            ...data.results,
+          }));
+        }
+      } catch {
+        // Ignore transient precheck network failures
+      }
+    })();
+  }, [customers, waGateway.status, waAutoSend.running]);
 
   // Batch check known shareloc & house photo status for active cards
   useEffect(() => {
@@ -1910,6 +2097,9 @@ export default function App() {
             ...data.results,
           }));
         }
+        if (Array.isArray(data?.dailySentPhones) && !cancelled) {
+          setDailySentPhones(new Set(data.dailySentPhones));
+        }
       } catch {
         // Ignore transient batch check errors
       }
@@ -1924,16 +2114,19 @@ export default function App() {
     waGateway.knownChatsCount,
     waGateway.knownSharelocCount,
     waGateway.knownHousePhotoCount,
+    waPrecheck.completed,
+    waPrecheck.running,
   ]);
 
-  // Poll status while QR/pairing modal is open or auto-send queue is active
+  // Poll status while QR/pairing modal is open, precheck is scanning, or auto-send queue is active
   useEffect(() => {
-    if (!showWaConnectModal && !waAutoSend.running) return;
+    if (!showWaConnectModal && !waAutoSend.running && !waPrecheck.running) return;
+    const intervalMs = waPrecheck.running && !waAutoSend.running ? 900 : 1500;
     const timer = window.setInterval(() => {
       void refreshWaGatewayStatus();
-    }, 1500);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [showWaConnectModal, waAutoSend.running]);
+  }, [showWaConnectModal, waAutoSend.running, waPrecheck.running]);
 
   // Live 1-second countdown display for 10-20s anti-ban gap
   useEffect(() => {
@@ -2189,7 +2382,8 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'filling' ? (
+          {/* Keep Filling mounted across tab switches so Otomatis mode continues generating & transferring per 10 items */}
+          <div className={activeTab === 'filling' ? 'h-full' : 'hidden'}>
             <BulkProcessorView
               bulkItems={bulkItems}
               setBulkItems={setBulkItemsWithLock}
@@ -2197,8 +2391,12 @@ export default function App() {
               setCustomers={setCustomers}
               onNavigateToSending={() => setActiveTab('modul1')}
               onClearFilling={() => setBulkItemsWithLock([])}
+              isActive={activeTab === 'filling'}
+              onAutoTransferBatchToSending={handleAutoTransferBatchToSending}
             />
-          ) : activeTab === 'modul2' ? (
+          </div>
+
+          {activeTab === 'filling' ? null : activeTab === 'modul2' ? (
             <SuccessView
               filteredCustomers={filteredCustomers}
               allSuccessList={allSuccessList}
@@ -2298,19 +2496,46 @@ export default function App() {
                           <RotateCcw className="w-3.5 h-3.5" />
                         </button>
                       </div>
+                    ) : filteredCustomers.length > 0 && pendingAutoSendCustomers.length === 0 ? (
+                      <button
+                        type="button"
+                        disabled
+                        className="px-3 py-1.5 rounded-lg bg-neutral-800/80 text-neutral-400 border border-neutral-700/60 text-[10px] font-extrabold flex items-center gap-1.5 opacity-60 cursor-not-allowed shrink-0"
+                        title="Semua data Sending telah selesai di-automasi. Tombol akan aktif kembali saat ada data baru masuk."
+                      >
+                        <CheckCircle className="w-3 h-3 text-emerald-400" />
+                        Automasi Selesai
+                      </button>
                     ) : (
                       <button
                         type="button"
                         onClick={handleStartAutoSendSending}
-                        disabled={filteredCustomers.length === 0}
-                        className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-[#C5A059] to-[#D4AF37] hover:brightness-110 disabled:opacity-40 text-black text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
-                        title="Mulai kirim pesan WhatsApp otomatis (jeda 10-20 detik, cek riwayat chat & shareloc sebelum kirim, lewati kartu Skip Manual)"
+                        disabled={pendingAutoSendCustomers.length === 0}
+                        className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-[#C5A059] to-[#D4AF37] hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed text-black text-[10px] font-extrabold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm shrink-0"
+                        title="Mulai kirim pesan WhatsApp otomatis (jeda 10-20 detik, maks. 1x/hari ke nomor sama)"
                       >
                         <Play className="w-3 h-3 fill-current" />
                         Mulai Kirim Otomatis
+                        {pendingAutoSendCustomers.length > 0 && pendingAutoSendCustomers.length < filteredCustomers.length
+                          ? ` (${pendingAutoSendCustomers.length})`
+                          : ''}
                       </button>
                     )}
                   </div>
+
+                  {/* Automatic read-only pre-scan progress banner (non-blocking) */}
+                  {waPrecheck.running && !waAutoSend.running && (
+                    <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-[10px] text-emerald-200">
+                      <span className="flex items-center gap-1.5 min-w-0 truncate">
+                        <RefreshCw className="w-3 h-3 animate-spin text-emerald-400 shrink-0" />
+                        <span className="truncate">
+                          Membaca pesan urutan {Math.min(waPrecheck.completed + 1, waPrecheck.total)}/{waPrecheck.total}
+                          {waPrecheck.currentCustomerName ? ` (${waPrecheck.currentCustomerName})` : ''}...
+                        </span>
+                      </span>
+                      <span className="text-[9px] font-bold text-emerald-300 shrink-0">Siap Auto-Send</span>
+                    </div>
+                  )}
 
                   {/* Manual Skip Counter Pill (when user marks cards to skip) */}
                   {(() => {
@@ -2333,6 +2558,27 @@ export default function App() {
                     );
                   })()}
 
+                  {/* Pending Filling Otomatis notice when WA gateway is not connected yet */}
+                  {waitingWaFillingAutoCount > 0 && waGateway.status !== 'connected' && (
+                    <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[10px] text-amber-200">
+                      <span className="truncate font-semibold">
+                        {waitingWaFillingAutoCount} data Filling siap auto-kirim (jeda 1 menit) — hubungkan WA dulu.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowWaConnectModal(true);
+                          if (waGateway.status === 'disconnected') {
+                            void connectWaGatewayClient().catch(() => {});
+                          }
+                        }}
+                        className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 text-[9px] font-bold shrink-0 cursor-pointer"
+                      >
+                        Hubungkan
+                      </button>
+                    </div>
+                  )}
+
                   {/* Auto-Send Live Progress & Result Summary Banner */}
                   {showAutoSendBanner && waAutoSend.phase !== 'idle' && (
                     <div
@@ -2351,7 +2597,9 @@ export default function App() {
                           )}
                           <span className="truncate">
                             {waAutoSend.phase === 'waiting_delay'
-                              ? `Jeda aman ${autoSendCountdownSec}d sebelum kirim ke ${waAutoSend.currentCustomerName}`
+                              ? waAutoSend.isInitialDelay
+                                ? `Jeda awal ${autoSendCountdownSec}d sebelum kirim otomatis dimulai (${waAutoSend.total} data)`
+                                : `Jeda aman ${autoSendCountdownSec}d sebelum kirim ke ${waAutoSend.currentCustomerName}`
                               : waAutoSend.phase === 'sending' || waAutoSend.phase === 'checking'
                               ? `Memproses: ${waAutoSend.currentCustomerName || '...'} (${waAutoSend.processed}/${waAutoSend.total})`
                               : waAutoSend.phase === 'paused'
@@ -2408,6 +2656,17 @@ export default function App() {
                       return filteredCustomers.map((cust) => {
                         const cardSeq = runningSeq;
                         runningSeq += getPackageCount(cust);
+                        const custNormPhone = cust.cleanPhone || cleanPhoneNumber(cust.phone || '');
+                        const custHistory = customerChatHistoryMap[custNormPhone];
+                        const isPrecheckingCard =
+                          activeTab === 'modul1' &&
+                          waPrecheck.running &&
+                          (waPrecheck.currentCustomerId === cust.id ||
+                            (Boolean(custNormPhone) && waPrecheck.currentCustomerPhone === custNormPhone));
+                        const hasPrecheckedCard =
+                          activeTab === 'modul1' &&
+                          (Boolean(custHistory?.deepChecked) ||
+                            (Boolean(custNormPhone) && Boolean(waPrecheck.checkedPhones?.includes(custNormPhone))));
                         return (
                           <CustomerCard
                             key={`${activeTab}_${cust.id}`}
@@ -2434,8 +2693,15 @@ export default function App() {
                             returnToModul1={returnToModul1}
                             toggleManualSkipAutoSend={activeTab === 'modul1' ? toggleManualSkipAutoSend : undefined}
                             autoSendItem={activeTab === 'modul1' ? waAutoSend.items[cust.id] : undefined}
-                            chatHistory={customerChatHistoryMap[cust.cleanPhone || cleanPhoneNumber(cust.phone || '')]}
+                            chatHistory={custHistory}
                             isCheckingWa={checkingWaCustomerId === cust.id}
+                            isPrecheckingWa={isPrecheckingCard}
+                            hasBeenPrechecked={hasPrecheckedCard}
+                            isDailySentToday={
+                              activeTab === 'modul1'
+                                ? dailySentPhones.has(custNormPhone)
+                                : false
+                            }
                           />
                         );
                       });

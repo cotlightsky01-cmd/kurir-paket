@@ -9,8 +9,11 @@ import {
   checkBatchCustomerChatRequirements,
   checkCustomerChatRequirements,
   connectWaGateway,
+  enqueueAutoSendBatch,
   getAutoSendState,
+  getDailyAutoSentPhonesToday,
   getHoldGroupsStatus,
+  getPrecheckState,
   getWaGatewayStatus,
   HoldBundlePartialError,
   initWaGatewayOnBoot,
@@ -22,6 +25,7 @@ import {
   sendDirectWaMediaMessage,
   sendHoldCameraBundle,
   startAutoSendQueue,
+  startPrecheckCustomers,
   stopAutoSendQueue,
   WaGatewayNotConnectedError,
   type AutoSendInputItem,
@@ -689,6 +693,8 @@ async function startServer() {
     res.json({
       gateway: getWaGatewayStatus(),
       autoSend: getAutoSendState(),
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 
@@ -698,6 +704,8 @@ async function startServer() {
       res.json({
         gateway,
         autoSend: getAutoSendState(),
+        precheck: getPrecheckState(),
+        dailySentPhones: getDailyAutoSentPhonesToday(),
       });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || "Gagal menghubungkan WhatsApp." });
@@ -726,6 +734,8 @@ async function startServer() {
       return res.json({
         gateway,
         autoSend: getAutoSendState(),
+        precheck: getPrecheckState(),
+        dailySentPhones: getDailyAutoSentPhonesToday(),
       });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || "Gagal memutuskan koneksi WhatsApp." });
@@ -736,6 +746,8 @@ async function startServer() {
     res.json({
       gateway: getWaGatewayStatus(),
       autoSend: getAutoSendState(),
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 
@@ -772,6 +784,36 @@ async function startServer() {
       ok: true,
       results,
       gateway: getWaGatewayStatus(),
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
+    });
+  });
+
+  app.post("/api/wa/precheck-customers", (req, res) => {
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const safeItems = rawItems
+      .filter((it: any) => it && typeof it.phone === "string" && it.phone.trim().length > 0)
+      .slice(0, 200)
+      .map((it: any) => ({
+        id: typeof it.id === "string" ? it.id.slice(0, 120) : undefined,
+        name: typeof it.name === "string" ? it.name.slice(0, 200) : "Pelanggan",
+        phone: it.phone.trim().slice(0, 40),
+      }));
+
+    if (safeItems.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Daftar nomor untuk pemeriksaan otomatis tidak boleh kosong.",
+      });
+    }
+
+    const { precheck, results } = startPrecheckCustomers(safeItems);
+    return res.json({
+      ok: true,
+      precheck,
+      results,
+      gateway: getWaGatewayStatus(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 
@@ -823,14 +865,39 @@ async function startServer() {
       if (rawItemsCount === 0 || rawItemsCount > 500 || items.length === 0) {
         return res.status(400).json({ error: "Daftar pengiriman modul Sending kosong atau melebihi batas." });
       }
+      const rawDelay = Number(req.body?.initialDelayMs);
+      const initialDelayMs = Number.isFinite(rawDelay) ? Math.max(0, Math.min(300_000, rawDelay)) : 0;
 
-      const autoSend = startAutoSendQueue(items, templates, tempatCodList);
+      const autoSend = startAutoSendQueue(items, templates, tempatCodList, { initialDelayMs });
       return res.json({
         gateway: getWaGatewayStatus(),
         autoSend,
+        precheck: getPrecheckState(),
+        dailySentPhones: getDailyAutoSentPhonesToday(),
       });
     } catch (err: any) {
       return res.status(400).json({ error: err?.message || "Gagal memulai kirim otomatis." });
+    }
+  });
+
+  app.post("/api/wa/auto-send/enqueue", (req, res) => {
+    try {
+      const { rawItemsCount, items, templates, tempatCodList } = parseAutoSendPayload(req.body);
+      if (rawItemsCount === 0 || rawItemsCount > 500 || items.length === 0) {
+        return res.status(400).json({ error: "Daftar pengiriman modul Sending kosong atau melebihi batas." });
+      }
+      const rawDelay = Number(req.body?.initialDelayMs);
+      const initialDelayMs = Number.isFinite(rawDelay) ? Math.max(0, Math.min(300_000, rawDelay)) : 60_000;
+
+      const autoSend = enqueueAutoSendBatch(items, templates, tempatCodList, { initialDelayMs });
+      return res.json({
+        gateway: getWaGatewayStatus(),
+        autoSend,
+        precheck: getPrecheckState(),
+        dailySentPhones: getDailyAutoSentPhonesToday(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || "Gagal menambahkan antrean kirim otomatis." });
     }
   });
 
@@ -839,6 +906,8 @@ async function startServer() {
     res.json({
       gateway: getWaGatewayStatus(),
       autoSend,
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 
@@ -854,6 +923,8 @@ async function startServer() {
       return res.json({
         gateway: getWaGatewayStatus(),
         autoSend,
+        precheck: getPrecheckState(),
+        dailySentPhones: getDailyAutoSentPhonesToday(),
       });
     } catch (err: any) {
       return res.status(400).json({ error: err?.message || "Gagal melanjutkan kirim otomatis." });
@@ -865,6 +936,8 @@ async function startServer() {
     res.json({
       gateway: getWaGatewayStatus(),
       autoSend,
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 
@@ -873,6 +946,8 @@ async function startServer() {
     res.json({
       gateway: getWaGatewayStatus(),
       autoSend,
+      precheck: getPrecheckState(),
+      dailySentPhones: getDailyAutoSentPhonesToday(),
     });
   });
 

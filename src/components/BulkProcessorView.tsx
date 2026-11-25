@@ -15,11 +15,13 @@ import {
   Pencil, 
   Save, 
   X as CloseIcon, 
-  Package 
+  Package,
+  SlidersHorizontal,
+  Zap
 } from 'lucide-react';
 import { extractBatchData } from '../services/gemini';
 import { cn } from '../lib/utils';
-import { BulkItem, Customer } from '../types';
+import { BulkItem, Customer, FillingMode } from '../types';
 import { 
   cleanPhoneNumber, 
   compressImageDataUrl, 
@@ -41,6 +43,11 @@ interface BulkProcessorViewProps {
   syncAddresses?: (items: BulkItem[]) => void;
   onNavigateToSending?: () => void;
   onClearFilling?: () => void;
+  isActive?: boolean;
+  onAutoTransferBatchToSending?: (
+    transferredCustomers: Customer[],
+    meta: { isFinalBatch: boolean; remainingCount: number }
+  ) => void;
 }
 
 export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
@@ -54,13 +61,27 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
   clearBulkItems,
   syncAddresses,
   onNavigateToSending,
-  onClearFilling
+  onClearFilling,
+  isActive = true,
+  onAutoTransferBatchToSending
 }) => {
+  const [fillingMode, setFillingMode] = useState<FillingMode>(() => {
+    try {
+      return localStorage.getItem('kurir_parser_filling_mode') === 'otomatis' ? 'otomatis' : 'manual';
+    } catch {
+      return 'manual';
+    }
+  });
+  const fillingModeRef = useRef<FillingMode>(fillingMode);
+  fillingModeRef.current = fillingMode;
+
   const [processing, setProcessing] = useState(false);
+  const isProcessingRef = useRef(false);
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(false);
   const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(new Set());
   const [isSending, setIsSending] = useState(false);
+  const isTransferringRef = useRef(false);
   const [sendNotice, setSendNotice] = useState<string | null>(null);
   const [isClearingAll, setIsClearingAll] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -150,6 +171,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
 
   // Listen for paste event anywhere in Filling view
   React.useEffect(() => {
+    if (!isActive) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (!e.clipboardData) return;
       const items = Array.from(e.clipboardData.items);
@@ -166,10 +188,14 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     };
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [bulkItems]);
+  }, [bulkItems, isActive]);
 
   // Helper functions that safely fallback to setBulkItems / setCustomers
   const handleAddBulkItems = (urls: string[]) => {
+    if (fillingModeRef.current === 'otomatis') {
+      isPausedRef.current = false;
+      setIsPaused(false);
+    }
     if (addBulkItems) {
       addBulkItems(urls);
     } else if (setBulkItems) {
@@ -190,6 +216,20 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
         }));
         return [...cleanPrev, ...newItems];
       });
+    }
+  };
+
+  const handleSelectFillingMode = (nextMode: FillingMode) => {
+    setFillingMode(nextMode);
+    fillingModeRef.current = nextMode;
+    try {
+      localStorage.setItem('kurir_parser_filling_mode', nextMode);
+    } catch {
+      // Ignore storage write error
+    }
+    if (nextMode === 'otomatis') {
+      isPausedRef.current = false;
+      setIsPaused(false);
     }
   };
 
@@ -520,103 +560,127 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     setIsClearingAll(false);
   };
 
-  // SEND FUNCTIONALITY: Only sends items with status === 'completed',
-  // leaves unfinished items in Filling so generation continues uninterrupted,
-  // and preserves original Filling batch order when sent in multiple stages.
-  const handleSendAllToSending = async () => {
-    const currentSnapshot = deduplicateById(bulkItemsRef.current);
-    const itemsToSend = currentSnapshot
-      .filter(item => item.status === 'completed')
-      .sort((a, b) => a.order - b.order);
+  // SEND FUNCTIONALITY: Only sends completed items, leaves unfinished items in Filling
+  // so generation continues uninterrupted, and preserves original Filling batch order across waves.
+  const transferItemsToSending = useCallback(async (
+    itemsToSend: BulkItem[],
+    options: { isAuto: boolean }
+  ) => {
+    if (itemsToSend.length === 0 || isTransferringRef.current || isSending || isClearingAll) return;
 
-    if (itemsToSend.length === 0 || isSending) return;
-
+    isTransferringRef.current = true;
     setIsSending(true);
     if (sendNoticeTimerRef.current !== null) {
       window.clearTimeout(sendNoticeTimerRef.current);
       sendNoticeTimerRef.current = null;
     }
 
-    // Ensure all items in this Filling session share one consistent fillingBatchId
-    // so later partial sends slot right back into their original positions in Sending.
-    const existingBatchId = currentSnapshot.find(b => b.fillingBatchId)?.fillingBatchId;
-    const activeBatchId = existingBatchId || `fbatch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    try {
+      const currentSnapshot = deduplicateById(bulkItemsRef.current);
+      // Ensure all items in this Filling session share one consistent fillingBatchId
+      // so later partial sends slot right back into their original positions in Sending.
+      const existingBatchId = currentSnapshot.find(b => b.fillingBatchId)?.fillingBatchId;
+      const activeBatchId = existingBatchId || `fbatch_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    if (setBulkItems) {
-      setBulkItems(prev =>
-        prev.map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
-      );
-    }
-
-    const sentIds = new Set<string>();
-
-    for (let i = 0; i < itemsToSend.length; i++) {
-      const item = itemsToSend[i];
-      sentIds.add(item.id);
-
-      const rawName = cleanPureName(item.name?.trim() || '') || 'Tanpa Nama';
-      const cleanAddr = cleanAddressText(item.address?.trim() || '') || 'Data Filling';
-      const rawPhone = item.phone?.trim() || '';
-      const cleanPh = cleanPhoneNumber(rawPhone);
-
-      const pkgCount = item.package_count ? Number(item.package_count) || 1 : 1;
-
-      const newCustomer: Customer = {
-        id: `cust_${item.id}_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 6)}`,
-        originalIndex: item.order || (customers?.length || 0) + 1,
-        name: rawName,
-        phone: rawPhone,
-        cleanPhone: cleanPh.length >= 8 ? cleanPh : '',
-        address: cleanAddr,
-        cod: item.cod_amount?.trim() || 'NO COD',
-        packageCount: pkgCount,
-        package_count: pkgCount,
-        status: 'modul1',
-        photos: [],
-        timestamp: Date.now() + i,
-        fillingBatchId: item.fillingBatchId || activeBatchId,
-        fillingOrder: item.order,
-      };
-
-      if (setCustomers) {
-        setCustomers(prev => insertCustomerPreservingOrder(prev, newCustomer));
-      } else if (syncAddresses) {
-        syncAddresses([item]);
-      }
-
-      // Remove only this completed item from bulkItems so Framer Motion triggers exit animation
-      // while unfinished items stay in Filling and continue generating.
       if (setBulkItems) {
         setBulkItems(prev =>
-          prev
-            .filter(b => b.id !== item.id)
-            .map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
+          prev.map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
         );
       }
 
-      // Fast stagger delay between items
-      await new Promise(res => setTimeout(res, 60));
-    }
+      const sentIds = new Set<string>();
+      const transferredCustomers: Customer[] = [];
 
-    // Small delay after last item slides out
-    await new Promise(res => setTimeout(res, 120));
-    const remainingItems = bulkItemsRef.current.filter(b => !sentIds.has(b.id));
-    setIsSending(false);
+      for (let i = 0; i < itemsToSend.length; i++) {
+        const item = itemsToSend[i];
+        sentIds.add(item.id);
 
-    if (remainingItems.length === 0) {
-      setSendNotice(null);
-      if (onNavigateToSending) {
-        onNavigateToSending();
+        const rawName = cleanPureName(item.name?.trim() || '') || 'Tanpa Nama';
+        const cleanAddr = cleanAddressText(item.address?.trim() || '') || 'Data Filling';
+        const rawPhone = item.phone?.trim() || '';
+        const cleanPh = cleanPhoneNumber(rawPhone);
+
+        const pkgCount = item.package_count ? Number(item.package_count) || 1 : 1;
+
+        const newCustomer: Customer = {
+          id: `cust_${item.id}_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 6)}`,
+          originalIndex: item.order || (customers?.length || 0) + 1,
+          name: rawName,
+          phone: rawPhone,
+          cleanPhone: cleanPh.length >= 8 ? cleanPh : '',
+          address: cleanAddr,
+          cod: item.cod_amount?.trim() || 'NO COD',
+          packageCount: pkgCount,
+          package_count: pkgCount,
+          status: 'modul1',
+          photos: [],
+          timestamp: Date.now() + i,
+          fillingBatchId: item.fillingBatchId || activeBatchId,
+          fillingOrder: item.order,
+        };
+
+        transferredCustomers.push(newCustomer);
+
+        if (setCustomers) {
+          setCustomers(prev => insertCustomerPreservingOrder(prev, newCustomer));
+        } else if (syncAddresses) {
+          syncAddresses([item]);
+        }
+
+        // Remove only this completed item from bulkItems so Framer Motion triggers exit animation
+        // while unfinished items stay in Filling and continue generating.
+        if (setBulkItems) {
+          setBulkItems(prev =>
+            prev
+              .filter(b => b.id !== item.id)
+              .map(b => (b.fillingBatchId ? b : { ...b, fillingBatchId: activeBatchId }))
+          );
+        }
+
+        // Fast stagger delay between items
+        await new Promise(res => setTimeout(res, 45));
       }
-    } else {
-      setSendNotice(
-        `${itemsToSend.length} data selesai dikirim ke Sending. ${remainingItems.length} data masih diproses di Filling.`
-      );
-      sendNoticeTimerRef.current = window.setTimeout(() => {
+
+      // Small delay after last item slides out
+      await new Promise(res => setTimeout(res, 100));
+      const remainingItems = bulkItemsRef.current.filter(b => !sentIds.has(b.id));
+
+      if (options.isAuto && onAutoTransferBatchToSending) {
+        onAutoTransferBatchToSending(transferredCustomers, {
+          isFinalBatch: remainingItems.length === 0,
+          remainingCount: remainingItems.length,
+        });
+      }
+
+      if (remainingItems.length === 0) {
         setSendNotice(null);
-        sendNoticeTimerRef.current = null;
-      }, 4500);
+        if (onNavigateToSending) {
+          onNavigateToSending();
+        }
+      } else {
+        setSendNotice(
+          options.isAuto
+            ? `Otomatis: ${itemsToSend.length} data dikirim ke Sending. ${remainingItems.length} data masih diproses di Filling.`
+            : `${itemsToSend.length} data selesai dikirim ke Sending. ${remainingItems.length} data masih diproses di Filling.`
+        );
+        sendNoticeTimerRef.current = window.setTimeout(() => {
+          setSendNotice(null);
+          sendNoticeTimerRef.current = null;
+        }, 4500);
+      }
+    } finally {
+      isTransferringRef.current = false;
+      setIsSending(false);
     }
+  }, [customers, isClearingAll, isSending, onAutoTransferBatchToSending, onNavigateToSending, setBulkItems, setCustomers, syncAddresses]);
+
+  const handleSendAllToSending = async () => {
+    const currentSnapshot = deduplicateById(bulkItemsRef.current);
+    const itemsToSend = currentSnapshot
+      .filter(item => item.status === 'completed')
+      .sort((a, b) => a.order - b.order);
+
+    await transferItemsToSending(itemsToSend, { isAuto: false });
   };
 
   const startEditing = (item: BulkItem) => {
@@ -709,12 +773,14 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
   };
 
   const handleProcess = async () => {
-    if (bulkItems.length === 0) return;
+    const currentSnapshot = deduplicateById(bulkItemsRef.current);
+    if (currentSnapshot.length === 0 || isProcessingRef.current) return;
     isPausedRef.current = false;
     setIsPaused(false);
+    isProcessingRef.current = true;
     setProcessing(true);
 
-    const itemsToProcess = bulkItems.filter(item => {
+    const itemsToProcess = currentSnapshot.filter(item => {
       if (item.status === 'completed') return false;
       
       // If item already has extracted data (name, address, or phone), lock its status as 'completed' and skip re-generate
@@ -734,6 +800,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
     });
 
     if (itemsToProcess.length === 0) {
+      isProcessingRef.current = false;
       setProcessing(false);
       return;
     }
@@ -881,6 +948,7 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
 
     await Promise.all([workerTop, workerBottom].filter(Boolean));
 
+    isProcessingRef.current = false;
     if (isPausedRef.current) {
       if (setBulkItems) {
         setBulkItems(prev => prev.map(item => item.status === 'processing' ? { ...item, status: 'pending' } : item));
@@ -892,6 +960,42 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
       setIsPaused(false);
     }
   };
+
+  // Automatic generation in Otomatis mode whenever pending items exist
+  useEffect(() => {
+    if (fillingMode !== 'otomatis') return;
+    if (processing || isProcessingRef.current || isPaused || isPausedRef.current || isSending || isClearingAll) return;
+
+    const hasUnprocessed = bulkItems.some(
+      (item) => item.status === 'pending' || item.status === 'processing'
+    );
+    if (hasUnprocessed) {
+      void handleProcess();
+    }
+  }, [fillingMode, bulkItems, processing, isPaused, isSending, isClearingAll]);
+
+  // Automatic Filling -> Sending transfer per 10 completed items (and final remainder until finished)
+  useEffect(() => {
+    if (fillingMode !== 'otomatis') return;
+    if (isPaused || isPausedRef.current || isSending || isClearingAll || isTransferringRef.current) return;
+
+    const ordered = deduplicateById(bulkItems).sort((a, b) => a.order - b.order);
+    if (ordered.length === 0) return;
+
+    const completedItems = ordered.filter((item) => item.status === 'completed');
+    const unfinishedCount = ordered.length - completedItems.length;
+
+    if (completedItems.length >= 10) {
+      void transferItemsToSending(completedItems.slice(0, 10), { isAuto: true });
+    } else if (
+      unfinishedCount === 0 &&
+      !processing &&
+      !isProcessingRef.current &&
+      completedItems.length > 0
+    ) {
+      void transferItemsToSending(completedItems, { isAuto: true });
+    }
+  }, [fillingMode, bulkItems, processing, isPaused, isSending, isClearingAll, transferItemsToSending]);
 
   const handleQuickFill = () => {
     bulkItems.forEach((item, idx) => {
@@ -939,56 +1043,97 @@ export const BulkProcessorView: React.FC<BulkProcessorViewProps> = ({
       )}
     >
       {/* Header */}
-      <div className="flex justify-between items-center mb-3 bg-[#18181B] border border-[#232328] rounded-2xl p-3.5 shadow-sm">
-        <div>
-          <h1 className="text-sm font-extrabold tracking-wider text-[#C5A059] uppercase">FILLING / BULK PROCESSOR</h1>
-          <p className="text-[11px] text-neutral-400 font-medium">
-            {draggingId
-              ? 'Geser kartu ke atas / bawah untuk atur posisi'
-              : bulkItems.length > 1
-                ? `${bulkItems.length} label dalam antrean • Tekan lama kartu untuk geser`
-                : `${bulkItems.length} label dalam antrean`}
-          </p>
-        </div>
-        <div className="flex gap-2">
-          {bulkItems.length > 0 && (
-            <>
-              {completedCount > 0 && (
+      <div className="mb-3 bg-[#18181B] border border-[#232328] rounded-2xl p-3.5 shadow-sm">
+        <div className="flex justify-between items-center gap-2">
+          <div className="min-w-0">
+            <h1 className="text-sm font-extrabold tracking-wider text-[#C5A059] uppercase">FILLING / BULK PROCESSOR</h1>
+            <p className="text-[11px] text-neutral-400 font-medium">
+              {draggingId
+                ? 'Geser kartu ke atas / bawah untuk atur posisi'
+                : bulkItems.length > 1
+                  ? `${bulkItems.length} label dalam antrean • Tekan lama kartu untuk geser`
+                  : `${bulkItems.length} label dalam antrean`}
+            </p>
+          </div>
+          <div className="flex gap-2 shrink-0">
+            {bulkItems.length > 0 && (
+              <>
+                {completedCount > 0 && (
+                  <button 
+                    onClick={handleCopyAll}
+                    className={cn(
+                      "px-3 py-1.5 bg-neutral-800 text-white border border-neutral-700 rounded-xl active:scale-95 transition-all flex items-center gap-1.5 font-bold text-[11px] shadow-sm cursor-pointer",
+                      copied && "bg-emerald-600 text-white border-emerald-500"
+                    )}
+                    title="Salin semua data hasil ekstrak"
+                  >
+                    {copied ? <Check size={14} /> : <Copy size={14} />}
+                    {copied ? "COPIED" : "COPY ALL"}
+                  </button>
+                )}
                 <button 
-                  onClick={handleCopyAll}
-                  className={cn(
-                    "px-3 py-1.5 bg-neutral-800 text-white border border-neutral-700 rounded-xl active:scale-95 transition-all flex items-center gap-1.5 font-bold text-[11px] shadow-sm cursor-pointer",
-                    copied && "bg-emerald-600 text-white border-emerald-500"
-                  )}
-                  title="Salin semua data hasil ekstrak"
+                  onClick={handleSendAllToSending}
+                  disabled={isSending || completedCount === 0}
+                  className="px-3 py-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 rounded-xl active:scale-95 transition-all flex items-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                  title="Kirim data yang sudah selesai generate ke modul Sending"
                 >
-                  {copied ? <Check size={14} /> : <Copy size={14} />}
-                  {copied ? "COPIED" : "COPY ALL"}
+                  <Send size={14} className={isSending ? "animate-pulse" : ""} />
+                  {isSending
+                    ? "SENDING..."
+                    : pendingCount > 0 && completedCount > 0
+                      ? `SEND (${completedCount})`
+                      : "SEND"}
                 </button>
+              </>
+            )}
+            <button 
+              onClick={handleClearAllFilling}
+              disabled={bulkItems.length === 0 || isSending}
+              className="p-2 bg-red-950/50 text-red-400 border border-red-900/60 hover:bg-red-900/60 rounded-xl active:scale-95 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+              title="Hapus seluruh file di modul Filling"
+            >
+              <Trash2 size={16} />
+            </button>
+          </div>
+        </div>
+
+        {/* 2 Mode Option Buttons: Manual vs Otomatis */}
+        <div className="mt-2.5 pt-2.5 border-t border-[#232328] space-y-1.5">
+          <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#111113] rounded-xl border border-[#232328]">
+            <button
+              type="button"
+              onClick={() => handleSelectFillingMode('manual')}
+              className={cn(
+                "py-1.5 px-2.5 rounded-lg text-[11px] font-extrabold flex items-center justify-center gap-1.5 transition-all cursor-pointer",
+                fillingMode === 'manual'
+                  ? "bg-[#27272D] text-white border border-[#C5A059]/40 shadow-sm"
+                  : "text-neutral-400 hover:text-neutral-200"
               )}
-              <button 
-                onClick={handleSendAllToSending}
-                disabled={isSending || completedCount === 0}
-                className="px-3 py-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 rounded-xl active:scale-95 transition-all flex items-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-                title="Kirim data yang sudah selesai generate ke modul Sending"
-              >
-                <Send size={14} className={isSending ? "animate-pulse" : ""} />
-                {isSending
-                  ? "SENDING..."
-                  : pendingCount > 0 && completedCount > 0
-                    ? `SEND (${completedCount})`
-                    : "SEND"}
-              </button>
-            </>
-          )}
-          <button 
-            onClick={handleClearAllFilling}
-            disabled={bulkItems.length === 0 || isSending}
-            className="p-2 bg-red-950/50 text-red-400 border border-red-900/60 hover:bg-red-900/60 rounded-xl active:scale-95 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-            title="Hapus seluruh file di modul Filling"
-          >
-            <Trash2 size={16} />
-          </button>
+              title="Pemrosesan manual seperti biasa (Play & SEND manual)"
+            >
+              <SlidersHorizontal size={13} className={fillingMode === 'manual' ? "text-[#C5A059]" : "text-neutral-500"} />
+              <span>Manual</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFillingMode('otomatis')}
+              className={cn(
+                "py-1.5 px-2.5 rounded-lg text-[11px] font-extrabold flex items-center justify-center gap-1.5 transition-all cursor-pointer",
+                fillingMode === 'otomatis'
+                  ? "bg-gradient-to-r from-[#C5A059] to-[#D4AF37] text-black shadow-sm"
+                  : "text-neutral-400 hover:text-neutral-200"
+              )}
+              title="Auto generate, kirim per 10 data ke Sending, lalu jeda 1 menit sebelum kirim WA otomatis"
+            >
+              <Zap size={13} className={fillingMode === 'otomatis' ? "fill-current text-black" : "text-neutral-500"} />
+              <span>Otomatis</span>
+            </button>
+          </div>
+          <p className="text-[10px] text-neutral-400 px-0.5 leading-snug">
+            {fillingMode === 'otomatis'
+              ? 'Otomatis: Generate langsung berjalan, kirim ke Sending per 10 data sampai selesai, lalu jeda 1 menit sebelum kirim WA otomatis.'
+              : 'Manual: Tekan Generate Resi (Play) dan tekan SEND manual ke modul Sending.'}
+          </p>
         </div>
       </div>
 

@@ -5,6 +5,7 @@ import {
   Copy,
   Check,
   Loader2,
+  Lock,
   LogOut,
   QrCode,
   RefreshCw,
@@ -158,6 +159,12 @@ export const WAAutoConnectModal: React.FC<WAAutoConnectModalProps> = ({
                     {gateway.status === 'connected' && gateway.user
                       ? `${gateway.user.name || 'WA'} (${gateway.user.phone}) • ${gateway.knownChatsCount} chat • ${gateway.knownSharelocCount ?? 0} loc • ${gateway.knownHousePhotoCount ?? 0} foto`
                       : `${gateway.knownChatsCount} chat • ${gateway.knownSharelocCount ?? 0} loc • ${gateway.knownHousePhotoCount ?? 0} foto`}
+                  </p>
+                  <p className="text-[10px] text-amber-300/90 flex items-center gap-1 mt-0.5 font-mono">
+                    <Lock className="w-3 h-3 shrink-0" />
+                    <span>
+                      Anchor terkunci: {gateway.lockedAnchorsCount ?? 0}/{gateway.maxAnchorsLimit ?? 6000} (aman saat putus/ganti metode)
+                    </span>
                   </p>
                 </div>
               </div>

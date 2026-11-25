@@ -47,6 +47,39 @@
         }
       },
       "required": ["customers", "updatedAt"]
+    },
+    "wa_chat_index_shard": {
+      "title": "WaChatIndexShard",
+      "description": "Compressed monotonic backup of WhatsApp chat index and locked history anchors",
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "description": "Encoding format identifier (gzip-json-v1)"
+        },
+        "payloadGzipB64": {
+          "type": "string",
+          "description": "Base64-encoded gzip-compressed JSON index payload",
+          "maxLength": 950000
+        },
+        "counts": {
+          "type": "object",
+          "description": "Summary counts for monotonic integrity verification"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last cloud index sync"
+        }
+      },
+      "required": ["format", "payloadGzipB64", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/app_data/{document}": {
+      "schema": {
+        "$ref": "#/entities/app_data"
+      },
+      "description": "Global shared application documents including global state, archived customers, and WhatsApp chat index shards"
     }
   }
 }
